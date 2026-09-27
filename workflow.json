@@ -88,8 +88,7 @@
       "keyword": "{var:keyword_http}",
       "title": "HTTP",
       "subtext": "Send a request, replay a curl command or look up a status code",
-      "script": "http_query=\"$1\" exec osascript -l JavaScript ./http.js filter",
-      "running": "Sending…"
+      "script": "http_query=\"$1\" exec osascript -l JavaScript ./http.js filter"
     },
     {
       "id": "ua_text",

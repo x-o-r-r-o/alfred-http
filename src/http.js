@@ -1662,24 +1662,39 @@ function removeNamed(name) {
   });
 }
 
-// Typed and pasted requests are stashed by content so ↩ (and the confirmation step) can find them
-function stash(req, line) {
+// A typed or pasted request travels to the action in an item variable (never in arg: it may hold
+// secrets), so nothing is written to disk while typing. One too large for the environment is
+// stashed in the cache by content instead.
+const VAR_MAX = 64 * 1024;
+function reqVars(req) {
+  const json = JSON.stringify(req);
+  if (json.length <= VAR_MAX) return { http_req: json };
   const id = fingerprint(req);
   const p = `${stashDir()}/${id}.json`;
-  if (!exists(p)) writeFile(p, JSON.stringify(Object.assign({}, req, { line: line || "" })));
-  return id;
+  if (!exists(p)) writeFile(p, json);
+  return { http_ref: `req:${id}` };
 }
 function loadStash(id) {
   if (!STASH_RE.test(id)) return null;
-  const raw = readJSON(`${stashDir()}/${id}.json`, null);
-  const req = cleanRequest(raw);
-  if (req) req.line = raw && typeof raw.line === "string" ? raw.line : "";
-  return req;
+  return cleanRequest(readJSON(`${stashDir()}/${id}.json`, null));
 }
-// "req:<id>" (stash), "hist:<rid>" (history) or "saved:<name>"
+// The request an action works on: $http_req (JSON), or $http_ref / arg as a reference
+function requestFromEnv(arg) {
+  const json = env("http_req", "");
+  if (json) {
+    try {
+      return cleanRequest(JSON.parse(json));
+    } catch (e) {
+      return null;
+    }
+  }
+  return loadRef(env("http_ref", arg));
+}
+// "req:<id>" (stash), "hist:<rid>" (history), "resp:<rid>" (a sent request) or "saved:<name>"
 function loadRef(ref) {
   ref = String(ref || "");
   if (ref.startsWith("req:")) return loadStash(ref.slice(4));
+  if (ref.startsWith("resp:")) return RID_RE.test(ref.slice(5)) ? cleanRequest(readJSON(`${respDir(ref.slice(5))}/request.json`, null)) : null;
   if (ref.startsWith("hist:")) {
     const e = loadHistory().find((x) => x.id === ref.slice(5));
     return e ? e.req : null;
@@ -1800,7 +1815,8 @@ function requestText(req) {
 const needsConfirm = (req) => CONFIRM && !SAFE_METHODS.has(req.method);
 
 // The row that sends a request (or, for POST/PUT/PATCH/DELETE…, opens the confirmation step)
-// o: {ref, stashId, title, prefix, kind: line|clipboard|history|saved, name, entry}
+// o: {ref (hist:/saved:/req: or none), line (the typed text), review (what ! reopens), title, prefix,
+//     kind: line|clipboard|history|saved|again|confirm, name, entry, confirmed}
 function requestRow(req, o) {
   const title = o.title || `${req.method} ${displayURL(req.url)}`;
   const confirm = needsConfirm(req) && !o.confirmed;
@@ -1811,8 +1827,9 @@ function requestRow(req, o) {
     title: oneLine(title, 200), subtitle: sub, icon: methodIcon(req.method),
     text: { copy: curl.length <= INLINE_MAX ? curl : curl.slice(0, INLINE_MAX), largetype: requestText(req) },
   };
-  if (confirm) Object.assign(item, { valid: false, autocomplete: `!${o.stashId || stash(req, o.line)}` });
-  else Object.assign(item, { arg: o.ref, variables: { http_action: "send", http_ref: o.ref } });
+  // the review step is a query: "!" + the typed request, or "!" + a reference (hist:…, saved:…, clip)
+  if (confirm) Object.assign(item, { valid: false, autocomplete: `!${o.review || o.ref || o.line}` });
+  else Object.assign(item, { arg: "send", variables: Object.assign({ http_action: "send" }, o.ref ? { http_ref: o.ref } : reqVars(req)) });
   if (req.method === "GET" && !req.body && !req.headers.length && !req.auth) item.quicklookurl = req.url;
   const mods = { cmd: pasteMod(curl, "⌘↩ Paste as a curl command") };
   if (req.method === "GET" && !req.body) mods.alt = { arg: req.url, subtitle: "⌥↩ Open in the browser", variables: { http_action: "open" } };
@@ -1872,13 +1889,11 @@ function clipboardRow() {
   try {
     if (/^curl(\.exe)?\s/i.test(clip)) {
       const req = parseCurl(clip);
-      const id = stash(req, clip);
-      return requestRow(req, { ref: `req:${id}`, stashId: id, prefix: "curl command in the clipboard", kind: "clipboard" });
+      return requestRow(req, { review: "clip", prefix: "curl command in the clipboard", kind: "clipboard" });
     }
     if (/^https?:\/\/\S+$/i.test(clip) && clip.length <= 4000) {
       const req = parseLine(clip);
-      const id = stash(req, clip);
-      return requestRow(req, { ref: `req:${id}`, stashId: id, prefix: "URL in the clipboard", kind: "clipboard" });
+      return requestRow(req, { review: "clip", prefix: "URL in the clipboard", kind: "clipboard" });
     }
   } catch (e) {
     if (e instanceof ParseError) return info(`Couldn’t read the curl command in the clipboard: ${e.message}`, "Nothing was sent", "error");
@@ -1890,7 +1905,8 @@ function clipboardRow() {
 function historyRow(e) {
   const ago = fmtAgo(now() - e.t);
   const result = e.status ? `${e.status} ${statusName(e.status)}` : e.error ? oneLine(e.error, 40) : "no response";
-  return requestRow(e.req, { ref: `hist:${e.id}`, prefix: `${result} · ${ago}`, kind: "history", entry: e, notes: [], line: "" });
+  const notes = e.req.redacted ? ["secrets weren’t kept"] : [];
+  return requestRow(e.req, { ref: `hist:${e.id}`, prefix: `${result} · ${ago}`, kind: "history", entry: e, notes });
 }
 function savedRow(e) {
   return requestRow(e.req, { ref: `saved:${e.name}`, title: `${e.name} · ${e.req.method} ${displayURL(e.req.url)}`, prefix: "Saved", kind: "saved", name: e.name, notes: [] });
@@ -1955,17 +1971,31 @@ function statusView(q) {
 }
 
 function requestView(req, line) {
-  const id = stash(req, line);
-  return { items: [requestRow(req, { ref: `req:${id}`, stashId: id, kind: "line", line }), ...detailRows(req)] };
+  return { items: [requestRow(req, { kind: "line", line }), ...detailRows(req)] };
 }
 
-function confirmView(id) {
-  const req = loadStash(id);
-  if (!req) return { items: [info("This request is no longer available", "Type it again", "error", { autocomplete: "" })] };
-  const row = requestRow(req, { ref: `req:${id}`, confirmed: true, kind: "confirm", notes: [], title: `Send ${req.method} ${displayURL(req.url)}` });
+// The review step before a POST, PUT, PATCH or DELETE: "!<typed request>", "!hist:<id>", "!saved:<name>",
+// "!req:<id>" or "!clip" (the clipboard, read again: what is shown is what is sent)
+function confirmView(what) {
+  let req = null, ref = null, back = "";
+  try {
+    if (/^(hist|saved|req|resp):/.test(what)) req = loadRef((ref = what));
+    else if (what === "clip") {
+      const clip = clipboardText().trim();
+      req = /^curl(\.exe)?\s/i.test(clip) ? parseCurl(clip) : /^https?:\/\/\S+$/i.test(clip) ? parseLine(clip) : null;
+    } else {
+      req = parseLine(what);
+      back = what;
+    }
+  } catch (e) {
+    if (!(e instanceof ParseError)) throw e;
+    return { items: [info(e.message, "Nothing was sent", "error", { autocomplete: what })] };
+  }
+  if (!req) return { items: [info("This request is no longer available", "Nothing was sent", "error", { autocomplete: "" })] };
+  const row = requestRow(req, { ref, confirmed: true, kind: "confirm", notes: [], title: `Send ${req.method} ${displayURL(req.url)}` });
   row.subtitle = `↩ Send now: this can change data on ${hostOf(req.url)}${requestSummary(req) ? " · " + requestSummary(req) : ""}`;
   row.icon = icon("send");
-  const cancel = info("Cancel", "Nothing was sent", "cancel", { autocomplete: req.line || "" });
+  const cancel = info("Cancel", "Nothing was sent", "cancel", { autocomplete: back });
   return { items: [row, cancel, ...detailRows(req)] };
 }
 
@@ -1981,8 +2011,7 @@ function saveView(rest) {
   if (after) {
     try {
       const req = parseLine(after);
-      const id = stash(req, after);
-      items.push(withMods({ title: `Save “${name}”: ${req.method} ${displayURL(req.url)}`, subtitle: `↩ Save${replace}`, arg: name, icon: icon("saved"), variables: { http_action: "save", http_name: name, http_ref: `req:${id}` } }));
+      items.push(withMods({ title: `Save “${name}”: ${req.method} ${displayURL(req.url)}`, subtitle: `↩ Save${replace}`, arg: name, icon: icon("saved"), variables: Object.assign({ http_action: "save", http_name: name }, reqVars(req)) }));
     } catch (e) {
       if (!(e instanceof ParseError)) throw e;
       items.push(info(e.message, "Type a request after the name, or pick a recent one below", "error"));
@@ -2032,8 +2061,7 @@ function responseView(rid) {
   const req = cleanRequest(readJSON(`${respDir(rid)}/request.json`, null)) || (hist && hist.req);
   const again = (title) => {
     if (!req) return null;
-    const ref = hist ? `hist:${rid}` : `req:${stash(req, "")}`;
-    return requestRow(req, { ref, title, kind: "again", notes: [] });
+    return requestRow(req, { ref: hist ? `hist:${rid}` : `resp:${rid}`, title, kind: "again", notes: [] });
   };
   if (st.state === "missing") {
     return { items: [info("This response is no longer cached", "Send the request again", "info"), again(null)].filter(Boolean) };
@@ -2128,7 +2156,7 @@ function filter(query) {
   const q = String(query).replace(/^\s+|\s+$/g, "");
   if (q === "") return homeView();
   let m;
-  if ((m = /^!([0-9a-f]{14})$/.exec(q))) return confirmView(m[1]);
+  if ((m = /^!\s*([\s\S]+)$/.exec(q))) return confirmView(m[1].trim());
   if ((m = /^=([a-z0-9-]{11,25})$/.exec(q)) && RID_RE.test(m[1])) return responseView(m[1]);
   if ((m = /^save(?:\s+([\s\S]*))?$/i.exec(q))) return saveView(m[1] || "");
   if (/^clear$/i.test(q)) return clearView();
@@ -2173,7 +2201,7 @@ function cancel(rid) {
   if (!RID_RE.test(rid)) return "";
   const dir = respDir(rid);
   if (exists(`${dir}/meta.json`)) return "";
-  for (const f of ["curlpid", "pid"]) {
+  for (const f of ["pid", "curlpid"]) { // the sender first, so it can't write a result after ours
     const pid = Number(readFile(`${dir}/${f}`));
     if (!alive(pid)) continue;
     // make sure the pid still belongs to this request before stopping it
@@ -2198,7 +2226,7 @@ function act(arg) {
   const report = env("HTTP_TEST_NOOPEN", "0") === "1";
   switch (action) {
     case "send": {
-      const req = loadRef(env("http_ref", arg));
+      const req = requestFromEnv(arg);
       if (!req) return "Couldn’t send the request: it’s no longer available";
       const rid = startSend(req);
       alfredSearch(`${keyword()} =${rid}`);
@@ -2235,7 +2263,7 @@ function act(arg) {
     case "save": {
       const name = env("http_name", arg).trim();
       if (!validName(name)) return "Couldn’t save the request: names can be 1–60 characters";
-      const req = loadRef(env("http_ref", ""));
+      const req = requestFromEnv("");
       if (!req) return "Couldn’t save the request: it’s no longer available";
       return saveNamed(name, req) ? `Saved “${name}”` : `Couldn’t save the request: there are already ${SAVED_MAX} saved requests`;
     }
@@ -2264,7 +2292,7 @@ function act(arg) {
 function wellFormed(k, v) {
   if (typeof v !== "string") return v;
   v = v.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g, (m) => (m.length === 2 ? m : "\ufffd"));
-  if (k === "arg" || k === "copy") return v; // copied text stays exact
+  if (k === "arg" || k === "copy" || k === "autocomplete") return v; // copied and typed text stays exact
   return v.replace(/[\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]/g, "").replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]+/g, " ");
 }
 

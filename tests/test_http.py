@@ -297,6 +297,7 @@ class RequestLineTests(unittest.TestCase):
             "example.com/ünïcode path?q=a b",
             "192.168.1.10/api",
             "example.com H:X-Token=abc== H:Y=1",
+            "[::1]:8080/x",
         ])
         self.assertEqual((r[0]["method"], r[0]["url"]), ("GET", "https://api.github.com/users/octocat"))
         self.assertEqual(r[1]["url"], "https://api.github.com")
@@ -320,6 +321,7 @@ class RequestLineTests(unittest.TestCase):
         self.assertEqual(r[13]["url"], "https://example.com/%C3%BCn%C3%AFcode")  # the space ends the URL
         self.assertEqual(r[14]["url"], "http://192.168.1.10/api")
         self.assertEqual(r[15]["headers"], [["X-Token", "abc=="], ["Y", "1"]])
+        self.assertEqual(r[16]["url"], "http://[::1]:8080/x")
 
     def test_errors(self):
         r = parse(["file:///etc/passwd", "ftp://example.com", "get", "notaurl", "example.com oops",
@@ -595,8 +597,9 @@ class FilterTests(Base):
         items = self.env.items("get api.github.com/users/octocat")
         row = items[0]
         self.assertEqual(row["title"], "GET api.github.com/users/octocat")
-        self.assertTrue(row["arg"].startswith("req:"))
+        self.assertEqual(row["arg"], "send")
         self.assertEqual(row["variables"]["http_action"], "send")
+        self.assertEqual(json.loads(row["variables"]["http_req"])["url"], "https://api.github.com/users/octocat")
         self.assertEqual(row["mods"]["cmd"]["arg"], "curl https://api.github.com/users/octocat")
         for name in ("curl", "JavaScript fetch", "Python requests", "HTTPie", "wget"):
             find(items, f"Copy as {name}")
@@ -617,14 +620,16 @@ class FilterTests(Base):
         items = self.env.items('post httpbin.org/post {"a":1}')
         row = items[0]
         self.assertIs(row["valid"], False)
-        self.assertRegex(row["autocomplete"], r"^![0-9a-f]{14}$")
+        self.assertEqual(row["autocomplete"], '!post httpbin.org/post {"a":1}')
         self.assertIn("Review before sending", row["subtitle"])
         confirm = self.env.items(row["autocomplete"])
         self.assertEqual(confirm[0]["title"], "Send POST httpbin.org/post")
         self.assertEqual(confirm[0]["variables"]["http_action"], "send")
         self.assertEqual(confirm[1]["title"], "Cancel")
         self.assertEqual(confirm[1]["autocomplete"], 'post httpbin.org/post {"a":1}')
-        self.assertEqual(self.env.items("!00000000000000")[0]["title"], "This request is no longer available")
+        self.assertEqual(self.env.items("!req:00000000000000")[0]["title"], "This request is no longer available")
+        self.assertEqual(self.env.items("!hist:zzzzzzzz-zzzz")[0]["title"], "This request is no longer available")
+        self.assertIn("doesn’t look like a URL", self.env.items("!nonsense")[0]["title"])
 
     def test_confirmation_can_be_turned_off(self):
         for v in ("0", " 0 ", "false"):
@@ -871,7 +876,7 @@ class SendTests(Base):
         for d in os.listdir(os.path.join(self.env.cache, "resp")):
             self.assertNotIn("SECRET3", readf(os.path.join(self.env.cache, "resp", d, "request.json")))
         home = self.env.items("")
-        find(home, "GET http://127.0.0.1")
+        self.assertIn("secrets weren’t kept", find(home, "GET http://127.0.0.1")["subtitle"])
 
     def test_history_filter_and_saved(self):
         self.env.send(f"get {BASE}/anything/alpha")
@@ -1022,7 +1027,7 @@ class Audit1RegressionTests(Base):
         self.assertEqual(r[1]["body"]["text"], "a=1&b=2")
 
     def test_home_view_prunes_old_stashes(self):
-        self.env.items("get example.com/one")
+        self.env.items("post example.com/one -d " + "x" * 70000, confirm_writes="0")  # too large for a variable
         stash = os.path.join(self.env.cache, "req")
         old = [os.path.join(stash, f) for f in os.listdir(stash)]
         self.assertEqual(len(old), 1)
@@ -1030,6 +1035,51 @@ class Audit1RegressionTests(Base):
         os.utime(old[0], (t, t))
         self.env.items("")
         self.assertFalse(os.path.exists(old[0]))
+
+
+class Audit2RegressionTests(Base):
+    def test_typing_writes_no_secrets_to_disk(self):
+        for q in ["get example.com H:Authorization=Bearer SECRETTYPED", "post example.com token=SECRETTYPED",
+                  "!post example.com token=SECRETTYPED", "save x get example.com H:X-Api-Key=SECRETTYPED"]:
+            self.env.items(q)
+        for base, dirs, files in os.walk(self.env.dir):
+            for f in files:
+                self.assertNotIn(b"SECRETTYPED", readf(os.path.join(base, f), "rb"), f)
+
+    def test_review_step_sends_what_it_shows(self):
+        row = self.env.items(f"post {BASE}/anything a=1")[0]
+        self.assertEqual(row["autocomplete"], f"!post {BASE}/anything a=1")
+        confirm = self.env.items(row["autocomplete"])
+        self.assertEqual(confirm[1]["autocomplete"], f"post {BASE}/anything a=1")  # Cancel
+        self.assertTrue(self.env.act(confirm[0]).startswith("sent "))
+        self.assertEqual(Mock.requests[-1]["body"], b'{"a": "1"}')
+        # the clipboard is read again in the review step
+        clip = f"curl -X DELETE {BASE}/anything/9"
+        row = self.env.items("", HTTP_TEST_CLIPBOARD=clip)[0]
+        self.assertEqual(row["autocomplete"], "!clip")
+        confirm = self.env.items("!clip", HTTP_TEST_CLIPBOARD=clip)
+        self.assertEqual(confirm[0]["title"], "Send DELETE http://127.0.0.1:%d/anything/9" % SERVER.server_port)
+        self.assertEqual(confirm[1]["autocomplete"], "")
+        self.assertEqual(self.env.items("!clip", HTTP_TEST_CLIPBOARD="hello")[0]["title"], "This request is no longer available")
+        # history and saved rows review by reference
+        self.env.act(confirm[0])
+        home = self.env.items("")
+        hist = find(home, "DELETE")
+        self.assertRegex(hist["autocomplete"], r"^!hist:[a-z0-9]+-[a-z0-9]+$")
+        self.assertEqual(self.env.items(hist["autocomplete"])[0]["title"], confirm[0]["title"])
+
+    def test_send_again_without_history(self):
+        rid, items = self.env.send(f"post {BASE}/anything b=2")
+        self.env.act({"arg": "history", "variables": {"http_action": "clear"}})
+        again = find(self.env.items("=" + rid), "Send again")
+        self.assertEqual(again["autocomplete"], f"!resp:{rid}")
+        confirm = self.env.items(again["autocomplete"])
+        self.assertTrue(self.env.act(confirm[0]).startswith("sent "))
+        self.assertEqual(Mock.requests[-1]["body"], b'{"b": "2"}')
+
+    def test_cancel_stops_the_sender_first(self):
+        src = readf(os.path.join(SRC, "http.js"))
+        self.assertIn('for (const f of ["pid", "curlpid"])', src)
 
 
 class PrototypeTests(Base):
