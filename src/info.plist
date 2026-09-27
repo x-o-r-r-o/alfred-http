@@ -1,0 +1,496 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>bundleid</key>
+	<string>io.github.x-o-r-r-o.http</string>
+	<key>category</key>
+	<string>Tools</string>
+	<key>connections</key>
+	<dict>
+		<key>02D48D15-A0A3-54AC-867D-1B1F1710D923</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>99CFA62C-5D9B-55D8-90E5-32E8D2666E17</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+		<key>0336056C-BD33-52A1-8915-484CC72F91BB</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>869377C3-5994-5F91-8566-FDB46C2F5530</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+		<key>4C74C560-2139-51C9-99E0-03262A8CB59C</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>0336056C-BD33-52A1-8915-484CC72F91BB</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+			<dict>
+				<key>destinationuid</key>
+				<string>0336056C-BD33-52A1-8915-484CC72F91BB</string>
+				<key>modifiers</key>
+				<integer>524288</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+			<dict>
+				<key>destinationuid</key>
+				<string>0336056C-BD33-52A1-8915-484CC72F91BB</string>
+				<key>modifiers</key>
+				<integer>262144</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+			<dict>
+				<key>destinationuid</key>
+				<string>02D48D15-A0A3-54AC-867D-1B1F1710D923</string>
+				<key>modifiers</key>
+				<integer>1048576</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+		<key>98486FCE-CE0C-53E9-B45B-B71148F42555</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>4C74C560-2139-51C9-99E0-03262A8CB59C</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+	</dict>
+	<key>createdby</key>
+	<string>x-o-r-r-o</string>
+	<key>description</key>
+	<string>Send HTTP requests, replay curl commands, convert them to code and look up status codes</string>
+	<key>disabled</key>
+	<false/>
+	<key>name</key>
+	<string>HTTP</string>
+	<key>objects</key>
+	<array>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>alfredfiltersresults</key>
+				<false/>
+				<key>alfredfiltersresultsmatchmode</key>
+				<integer>0</integer>
+				<key>argumenttreatemptyqueryasnil</key>
+				<true/>
+				<key>argumenttrimmode</key>
+				<integer>0</integer>
+				<key>argumenttype</key>
+				<integer>1</integer>
+				<key>escaping</key>
+				<integer>102</integer>
+				<key>keyword</key>
+				<string>{var:keyword_http}</string>
+				<key>queuedelaycustom</key>
+				<integer>3</integer>
+				<key>queuedelayimmediatelyinitially</key>
+				<true/>
+				<key>queuedelaymode</key>
+				<integer>0</integer>
+				<key>queuemode</key>
+				<integer>1</integer>
+				<key>runningsubtext</key>
+				<string>Sending…</string>
+				<key>script</key>
+				<string>http_query="$1" exec osascript -l JavaScript ./http.js filter</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string></string>
+				<key>skipuniversalaction</key>
+				<true/>
+				<key>subtext</key>
+				<string>Send a request, replay a curl command or look up a status code</string>
+				<key>title</key>
+				<string>HTTP</string>
+				<key>type</key>
+				<integer>0</integer>
+				<key>withspace</key>
+				<true/>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.input.scriptfilter</string>
+			<key>uid</key>
+			<string>4C74C560-2139-51C9-99E0-03262A8CB59C</string>
+			<key>version</key>
+			<integer>3</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>acceptsfiles</key>
+				<false/>
+				<key>acceptsmulti</key>
+				<integer>0</integer>
+				<key>acceptstext</key>
+				<true/>
+				<key>acceptsurls</key>
+				<true/>
+				<key>name</key>
+				<string>Send with HTTP</string>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.trigger.universalaction</string>
+			<key>uid</key>
+			<string>98486FCE-CE0C-53E9-B45B-B71148F42555</string>
+			<key>version</key>
+			<integer>1</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>concurrently</key>
+				<false/>
+				<key>escaping</key>
+				<integer>102</integer>
+				<key>script</key>
+				<string>osascript -l JavaScript ./http.js act "$1"</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string></string>
+				<key>type</key>
+				<integer>0</integer>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.action.script</string>
+			<key>uid</key>
+			<string>0336056C-BD33-52A1-8915-484CC72F91BB</string>
+			<key>version</key>
+			<integer>2</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>concurrently</key>
+				<false/>
+				<key>escaping</key>
+				<integer>102</integer>
+				<key>script</key>
+				<string>./resolve.sh "$1"</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string></string>
+				<key>type</key>
+				<integer>0</integer>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.action.script</string>
+			<key>uid</key>
+			<string>02D48D15-A0A3-54AC-867D-1B1F1710D923</string>
+			<key>version</key>
+			<integer>2</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>autopaste</key>
+				<true/>
+				<key>clipboardtext</key>
+				<string>{query}</string>
+				<key>ignoredynamicplaceholders</key>
+				<true/>
+				<key>transient</key>
+				<false/>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.output.clipboard</string>
+			<key>uid</key>
+			<string>99CFA62C-5D9B-55D8-90E5-32E8D2666E17</string>
+			<key>version</key>
+			<integer>3</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>lastpathcomponent</key>
+				<false/>
+				<key>onlyshowifquerypopulated</key>
+				<true/>
+				<key>removeextension</key>
+				<false/>
+				<key>text</key>
+				<string>{query}</string>
+				<key>title</key>
+				<string>{var:alfred_workflow_name}</string>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.output.notification</string>
+			<key>uid</key>
+			<string>869377C3-5994-5F91-8566-FDB46C2F5530</string>
+			<key>version</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>readme</key>
+	<string>## Usage
+
+Type a request via the `http` keyword: a URL, optionally after a method, like `http get api.github.com/users/octocat`. Add headers as `Name:value` or `H:Name=value`, query parameters as `name==value`, JSON fields as `name=value` (text) or `name:=36` (raw JSON), or end with a JSON body, like `http post httpbin.org/post {"name": "Ada"}`. Add `-f` to send the fields as a form, `-u user:password` for basic authentication and `-d` before a raw body. Quote values that contain spaces, or keep typing after a header: `H:Authorization=Bearer abc123`.
+
+* &lt;kbd&gt;↩&lt;/kbd&gt; Send the request. POST, PUT, PATCH and DELETE show what will be sent first; press &lt;kbd&gt;↩&lt;/kbd&gt; again to send.
+* &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Paste the request as a curl command.
+* &lt;kbd&gt;⌥&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Open the URL in the browser.
+* &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;L&lt;/kbd&gt; Show the request in Large Type, with secrets masked.
+
+The rows below show the headers and body, and copy the request as curl, JavaScript fetch, Python requests, HTTPie or wget.
+
+The response opens in Alfred when it arrives: status, timing (DNS, connect, TLS, time to first byte and total), size, headers and a preview of the body. JSON is pretty-printed, and text in other encodings is decoded.
+
+* &lt;kbd&gt;↩&lt;/kbd&gt; Copy the body, or open an image or PDF.
+* &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Paste the body into the frontmost app.
+* &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;Y&lt;/kbd&gt; Quick Look the body: JSON, HTML, images and PDFs.
+* &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;L&lt;/kbd&gt; Show the status, headers and body in Large Type.
+
+### curl commands
+
+Copy a request in your browser’s developer tools (Network › Copy as cURL), then use the `http` keyword: the command in the clipboard appears first, ready to send again. Alternatively, paste a command after the keyword, or select one and use the Universal Action. Commands are read without running a shell, and options that would read local files are refused.
+
+### History and saved requests
+
+Recent requests appear via the `http` keyword with nothing typed after it, and typing filters them by URL. Save a request by name via `http save &lt;name&gt;`, then pick a recent request or type one after the name. Authorization headers, cookies, API keys and passwords are masked everywhere they are shown.
+
+* &lt;kbd&gt;↩&lt;/kbd&gt; Send the request again.
+* &lt;kbd&gt;⌥&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Show its last response.
+* &lt;kbd&gt;⌃&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Remove it from the history or delete the saved request.
+
+Clear the history or the cached responses via `http clear`.
+
+### Status codes
+
+Look up what a status code means via the `http` keyword, like `http 404`, or list a class with `http 4xx`. This works offline and includes common unofficial codes from nginx and Cloudflare.
+
+Set the timeout, the response size limit, whether to follow redirects and whether to ask before sending POST, PUT, PATCH and DELETE in the Workflow’s Configuration.
+</string>
+	<key>uidata</key>
+	<dict>
+		<key>02D48D15-A0A3-54AC-867D-1B1F1710D923</key>
+		<dict>
+			<key>note</key>
+			<string>Reads long results back from the cache</string>
+			<key>xpos</key>
+			<integer>470</integer>
+			<key>ypos</key>
+			<integer>150</integer>
+		</dict>
+		<key>0336056C-BD33-52A1-8915-484CC72F91BB</key>
+		<dict>
+			<key>note</key>
+			<string>Send, copy, open, save, cancel</string>
+			<key>xpos</key>
+			<integer>470</integer>
+			<key>ypos</key>
+			<integer>20</integer>
+		</dict>
+		<key>4C74C560-2139-51C9-99E0-03262A8CB59C</key>
+		<dict>
+			<key>xpos</key>
+			<integer>250</integer>
+			<key>ypos</key>
+			<integer>20</integer>
+		</dict>
+		<key>869377C3-5994-5F91-8566-FDB46C2F5530</key>
+		<dict>
+			<key>xpos</key>
+			<integer>690</integer>
+			<key>ypos</key>
+			<integer>150</integer>
+		</dict>
+		<key>98486FCE-CE0C-53E9-B45B-B71148F42555</key>
+		<dict>
+			<key>xpos</key>
+			<integer>30</integer>
+			<key>ypos</key>
+			<integer>20</integer>
+		</dict>
+		<key>99CFA62C-5D9B-55D8-90E5-32E8D2666E17</key>
+		<dict>
+			<key>xpos</key>
+			<integer>690</integer>
+			<key>ypos</key>
+			<integer>20</integer>
+		</dict>
+	</dict>
+	<key>userconfigurationconfig</key>
+	<array>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string>http</string>
+				<key>placeholder</key>
+				<string>http</string>
+				<key>required</key>
+				<true/>
+				<key>trim</key>
+				<true/>
+			</dict>
+			<key>description</key>
+			<string>Requests, curl commands, history, saved requests and status codes</string>
+			<key>label</key>
+			<string>Keyword</string>
+			<key>type</key>
+			<string>textfield</string>
+			<key>variable</key>
+			<string>keyword_http</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string>30</string>
+				<key>placeholder</key>
+				<string>30</string>
+				<key>required</key>
+				<false/>
+				<key>trim</key>
+				<true/>
+			</dict>
+			<key>description</key>
+			<string>Seconds before a request is given up (1–600)</string>
+			<key>label</key>
+			<string>Timeout</string>
+			<key>type</key>
+			<string>textfield</string>
+			<key>variable</key>
+			<string>timeout</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string>10</string>
+				<key>pairs</key>
+				<array>
+					<array>
+						<string>1 MB</string>
+						<string>1</string>
+					</array>
+					<array>
+						<string>10 MB</string>
+						<string>10</string>
+					</array>
+					<array>
+						<string>50 MB</string>
+						<string>50</string>
+					</array>
+					<array>
+						<string>100 MB</string>
+						<string>100</string>
+					</array>
+				</array>
+			</dict>
+			<key>description</key>
+			<string>Downloading stops at this size</string>
+			<key>label</key>
+			<string>Response size limit</string>
+			<key>type</key>
+			<string>popupbutton</string>
+			<key>variable</key>
+			<string>max_size</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<true/>
+				<key>required</key>
+				<false/>
+				<key>text</key>
+				<string>Ask before sending POST, PUT, PATCH and DELETE</string>
+			</dict>
+			<key>description</key>
+			<string></string>
+			<key>label</key>
+			<string>Safety</string>
+			<key>type</key>
+			<string>checkbox</string>
+			<key>variable</key>
+			<string>confirm_writes</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<true/>
+				<key>required</key>
+				<false/>
+				<key>text</key>
+				<string>Follow redirects</string>
+			</dict>
+			<key>description</key>
+			<string>Redirects are only followed to http:// and https:// URLs.</string>
+			<key>label</key>
+			<string></string>
+			<key>type</key>
+			<string>checkbox</string>
+			<key>variable</key>
+			<string>follow_redirects</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<true/>
+				<key>required</key>
+				<false/>
+				<key>text</key>
+				<string>Remember secrets</string>
+			</dict>
+			<key>description</key>
+			<string>Keeps Authorization, cookie and API key headers so requests can be sent again. They are always masked on screen.</string>
+			<key>label</key>
+			<string>History</string>
+			<key>type</key>
+			<string>checkbox</string>
+			<key>variable</key>
+			<string>keep_secrets</string>
+		</dict>
+	</array>
+	<key>variables</key>
+	<dict/>
+	<key>variablesdontexport</key>
+	<array/>
+	<key>version</key>
+	<string>1.0.0</string>
+	<key>webaddress</key>
+	<string>https://github.com/x-o-r-r-o/alfred-http</string>
+</dict>
+</plist>

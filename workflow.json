@@ -1,0 +1,132 @@
+{
+  "bundleid": "io.github.x-o-r-r-o.http",
+  "name": "HTTP",
+  "description": "Send HTTP requests, replay curl commands, convert them to code and look up status codes",
+  "category": "Tools",
+  "createdby": "x-o-r-r-o",
+  "webaddress": "https://github.com/x-o-r-r-o/alfred-http",
+  "version": "1.0.0",
+  "variablesdontexport": [],
+  "config": [
+    {
+      "type": "textfield",
+      "variable": "keyword_http",
+      "label": "Keyword",
+      "description": "Requests, curl commands, history, saved requests and status codes",
+      "config": {
+        "default": "http",
+        "placeholder": "http",
+        "required": true,
+        "trim": true
+      }
+    },
+    {
+      "type": "textfield",
+      "variable": "timeout",
+      "label": "Timeout",
+      "description": "Seconds before a request is given up (1–600)",
+      "config": {
+        "default": "30",
+        "placeholder": "30",
+        "required": false,
+        "trim": true
+      }
+    },
+    {
+      "type": "popupbutton",
+      "variable": "max_size",
+      "label": "Response size limit",
+      "description": "Downloading stops at this size",
+      "config": {
+        "default": "10",
+        "pairs": [
+          ["1 MB", "1"],
+          ["10 MB", "10"],
+          ["50 MB", "50"],
+          ["100 MB", "100"]
+        ]
+      }
+    },
+    {
+      "type": "checkbox",
+      "variable": "confirm_writes",
+      "label": "Safety",
+      "description": "",
+      "config": {
+        "default": true,
+        "required": false,
+        "text": "Ask before sending POST, PUT, PATCH and DELETE"
+      }
+    },
+    {
+      "type": "checkbox",
+      "variable": "follow_redirects",
+      "label": "",
+      "description": "Redirects are only followed to http:// and https:// URLs.",
+      "config": {
+        "default": true,
+        "required": false,
+        "text": "Follow redirects"
+      }
+    },
+    {
+      "type": "checkbox",
+      "variable": "keep_secrets",
+      "label": "History",
+      "description": "Keeps Authorization, cookie and API key headers so requests can be sent again. They are always masked on screen.",
+      "config": {
+        "default": true,
+        "required": false,
+        "text": "Remember secrets"
+      }
+    }
+  ],
+  "objects": [
+    {
+      "id": "sf_http",
+      "type": "scriptfilter",
+      "keyword": "{var:keyword_http}",
+      "title": "HTTP",
+      "subtext": "Send a request, replay a curl command or look up a status code",
+      "script": "http_query=\"$1\" exec osascript -l JavaScript ./http.js filter",
+      "running": "Sending…"
+    },
+    {
+      "id": "ua_text",
+      "type": "universalaction",
+      "name": "Send with HTTP",
+      "text": true,
+      "urls": true
+    },
+    {
+      "id": "act",
+      "type": "script",
+      "script": "osascript -l JavaScript ./http.js act \"$1\"",
+      "note": "Send, copy, open, save, cancel"
+    },
+    {
+      "id": "resolve_paste",
+      "type": "script",
+      "script": "./resolve.sh \"$1\"",
+      "note": "Reads long results back from the cache"
+    },
+    {
+      "id": "paste",
+      "type": "clipboard",
+      "autopaste": true
+    },
+    {
+      "id": "notify",
+      "type": "notification"
+    }
+  ],
+  "connections": [
+    { "from": "ua_text", "to": "sf_http" },
+    { "from": "sf_http", "to": "act" },
+    { "from": "sf_http", "to": "act", "mod": "alt" },
+    { "from": "sf_http", "to": "act", "mod": "ctrl" },
+    { "from": "sf_http", "to": "resolve_paste", "mod": "cmd" },
+    { "from": "resolve_paste", "to": "paste" },
+    { "from": "act", "to": "notify" }
+  ]
+}
