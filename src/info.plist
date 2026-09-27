@@ -263,7 +263,7 @@
 	<key>readme</key>
 	<string>## Usage
 
-Type a request via the `http` keyword: a URL, optionally after a method, like `http get api.github.com/users/octocat`. Add headers as `Name:value` or `H:Name=value`, query parameters as `name==value`, JSON fields as `name=value` (text) or `name:=36` (raw JSON), or end with a JSON body, like `http post httpbin.org/post {"name": "Ada"}`. Add `-f` to send the fields as a form, `-u user:password` for basic authentication and `-d` before a raw body. Quote values that contain spaces, or keep typing after a header: `H:Authorization=Bearer abc123`.
+Type a request via the `http` keyword: a URL, optionally after a method, like `http get api.github.com/users/octocat`. Add headers as `Name:value` or `H:Name=value` (`Name;` sends an empty one), query parameters as `name==value`, JSON fields as `name=value` (text) or `name:=36` (raw JSON), or end with a JSON body, like `http post httpbin.org/post {"name": "Ada"}`. Nest fields the way HTTPie does: `user[name]=Ada user[langs][]=en` sends `{"user": {"name": "Ada", "langs": ["en"]}}`. Add `-f` to send the fields as a form, `-u user:password` for basic authentication, `-A bearer -a &lt;token&gt;` for a bearer token and `-d` before a raw body. Quote values that contain spaces, or keep typing after a header: `H:Authorization=Bearer abc123`.
 
 * &lt;kbd&gt;↩&lt;/kbd&gt; Send the request. POST, PUT, PATCH and DELETE show what will be sent first; press &lt;kbd&gt;↩&lt;/kbd&gt; again to send.
 * &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Paste the request as a curl command.
@@ -272,7 +272,7 @@ Type a request via the `http` keyword: a URL, optionally after a method, like `h
 
 The rows below show the headers and body, and copy the request as curl, JavaScript fetch, Python requests, HTTPie or wget.
 
-The response opens in Alfred when it arrives: status, timing (DNS, connect, TLS, time to first byte and total), size, headers and a preview of the body. JSON is pretty-printed, and text in other encodings is decoded.
+The response opens in Alfred when it arrives: status, timing (DNS, connect, TLS, time to first byte and total), size, headers and a preview of the body. JSON is pretty-printed, and text in other encodings is decoded. Quick Look shows HTML pages and SVG images without scripts, styles or anything loaded from the web.
 
 * &lt;kbd&gt;↩&lt;/kbd&gt; Copy the body, open an image or PDF, or show other files in Finder.
 * &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Paste the body into the frontmost app.
@@ -281,11 +281,11 @@ The response opens in Alfred when it arrives: status, timing (DNS, connect, TLS,
 
 ### curl commands
 
-Copy a request in your browser’s developer tools (Network › Copy as cURL), then use the `http` keyword: the command in the clipboard appears first, ready to send again. Alternatively, paste a command after the keyword, or select one and use the Universal Action. Commands are read without running a shell, and options that would read local files are refused.
+Copy a request in your browser’s developer tools (Network › Copy as cURL), then use the `http` keyword: the command in the clipboard appears first, ready to send again. Alternatively, paste a command after the keyword, or select one and use the Universal Action. Commands are read without running a shell or curl: options that would read local files are refused, and output options like `-o` are ignored.
 
 ### History and saved requests
 
-Recent requests appear via the `http` keyword with nothing typed after it, and typing filters them by URL. Save a request by name via `http save &lt;name&gt;`, then pick a recent request or type one after the name. Authorization headers, cookies, API keys and passwords are masked everywhere they are shown.
+Recent requests appear via the `http` keyword with nothing typed after it, and typing filters them by URL. Save a request by name via `http save &lt;name&gt;`, then pick a recent request or type one after the name. Authorization headers, cookies, API keys and passwords are masked everywhere they are shown. The history leaves them out unless “Remember secrets” is on in the Workflow’s Configuration, which keeps them in the macOS Keychain; saved requests always keep theirs in the Keychain.
 
 * &lt;kbd&gt;↩&lt;/kbd&gt; Send the request again.
 * &lt;kbd&gt;⌥&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Show its last response.
@@ -297,7 +297,7 @@ Clear the history or the cached responses via `http clear`.
 
 Look up what a status code means via the `http` keyword, like `http 404`, or list a class with `http 4xx`. This works offline and includes common unofficial codes from nginx and Cloudflare.
 
-Set the timeout, the response size limit, whether to follow redirects and whether to ask before sending POST, PUT, PATCH and DELETE in the Workflow’s Configuration.
+Set the timeout, the response size limit, whether to follow redirects, whether to ask before sending POST, PUT, PATCH and DELETE, and whether to remember secrets in the Workflow’s Configuration. Requests go through the HTTP, HTTPS or SOCKS proxy set in System Settings.
 </string>
 	<key>uidata</key>
 	<dict>
@@ -468,14 +468,14 @@ Set the timeout, the response size limit, whether to follow redirects and whethe
 			<key>config</key>
 			<dict>
 				<key>default</key>
-				<true/>
+				<false/>
 				<key>required</key>
 				<false/>
 				<key>text</key>
 				<string>Remember secrets</string>
 			</dict>
 			<key>description</key>
-			<string>Keeps Authorization, cookie and API key headers so requests can be sent again. They are always masked on screen.</string>
+			<string>Keeps the Authorization, cookie, API key and password values of recent requests in the macOS Keychain so they can be sent again. Off: the history is kept without them. Saved requests always keep theirs in the Keychain.</string>
 			<key>label</key>
 			<string>History</string>
 			<key>type</key>

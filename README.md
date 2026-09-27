@@ -4,7 +4,7 @@ Send HTTP requests from Alfred, replay curl commands copied from your browser, c
 
 ## Usage
 
-Type a request via the `http` keyword: a URL, optionally after a method, like `http get api.github.com/users/octocat`. Add headers as `Name:value` or `H:Name=value`, query parameters as `name==value`, JSON fields as `name=value` (text) or `name:=36` (raw JSON), or end with a JSON body, like `http post httpbin.org/post {"name": "Ada"}`. Add `-f` to send the fields as a form, `-u user:password` for basic authentication and `-d` before a raw body. Quote values that contain spaces, or keep typing after a header: `H:Authorization=Bearer abc123`.
+Type a request via the `http` keyword: a URL, optionally after a method, like `http get api.github.com/users/octocat`. Add headers as `Name:value` or `H:Name=value` (`Name;` sends an empty one), query parameters as `name==value`, JSON fields as `name=value` (text) or `name:=36` (raw JSON), or end with a JSON body, like `http post httpbin.org/post {"name": "Ada"}`. Nest fields the way HTTPie does: `user[name]=Ada user[langs][]=en` sends `{"user": {"name": "Ada", "langs": ["en"]}}`. Add `-f` to send the fields as a form, `-u user:password` for basic authentication, `-A bearer -a <token>` for a bearer token and `-d` before a raw body. Quote values that contain spaces, or keep typing after a header: `H:Authorization=Bearer abc123`.
 
 ![Typing a request](images/request.png)
 
@@ -17,7 +17,7 @@ The rows below show the headers and body, and copy the request as curl, JavaScri
 
 ![Converting a request to code](images/convert.png)
 
-The response opens in Alfred when it arrives: status, timing (DNS, connect, TLS, time to first byte and total), size, headers and a preview of the body. JSON is pretty-printed, and text in other encodings is decoded.
+The response opens in Alfred when it arrives: status, timing (DNS, connect, TLS, time to first byte and total), size, headers and a preview of the body. JSON is pretty-printed, and text in other encodings is decoded. Quick Look shows HTML pages and SVG images without scripts, styles or anything loaded from the web.
 
 ![A response](images/response.png)
 
@@ -28,13 +28,13 @@ The response opens in Alfred when it arrives: status, timing (DNS, connect, TLS,
 
 ### curl commands
 
-Copy a request in your browser’s developer tools (Network › Copy as cURL), then use the `http` keyword: the command in the clipboard appears first, ready to send again. Alternatively, paste a command after the keyword, or select one and use the Universal Action. Commands are read without running a shell, and options that would read local files are refused.
+Copy a request in your browser’s developer tools (Network › Copy as cURL), then use the `http` keyword: the command in the clipboard appears first, ready to send again. Alternatively, paste a command after the keyword, or select one and use the Universal Action. Commands are read without running a shell or curl: options that would read local files are refused, and output options like `-o` are ignored.
 
 ![Replaying a curl command from the clipboard](images/curl.png)
 
 ### History and saved requests
 
-Recent requests appear via the `http` keyword with nothing typed after it, and typing filters them by URL. Save a request by name via `http save <name>`, then pick a recent request or type one after the name. Authorization headers, cookies, API keys and passwords are masked everywhere they are shown.
+Recent requests appear via the `http` keyword with nothing typed after it, and typing filters them by URL. Save a request by name via `http save <name>`, then pick a recent request or type one after the name. Authorization headers, cookies, API keys and passwords are masked everywhere they are shown. The history leaves them out unless “Remember secrets” is on in the Workflow’s Configuration, which keeps them in the macOS Keychain; saved requests always keep theirs in the Keychain.
 
 ![Recent and saved requests](images/history.png)
 
@@ -50,7 +50,7 @@ Look up what a status code means via the `http` keyword, like `http 404`, or lis
 
 ![Looking up a status code](images/status.png)
 
-Set the timeout, the response size limit, whether to follow redirects and whether to ask before sending POST, PUT, PATCH and DELETE in the Workflow’s Configuration.
+Set the timeout, the response size limit, whether to follow redirects, whether to ask before sending POST, PUT, PATCH and DELETE, and whether to remember secrets in the Workflow’s Configuration. Requests go through the HTTP, HTTPS or SOCKS proxy set in System Settings.
 
 ## Development
 

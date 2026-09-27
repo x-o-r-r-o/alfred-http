@@ -8,10 +8,17 @@
 //   tokenize / parse  test suite only: JSON array of commands on stdin → JSON on stdout
 ObjC.import("Foundation");
 ObjC.import("AppKit");
+ObjC.import("Security");
+ObjC.import("CFNetwork");
 ObjC.bindFunction("setsid", ["int", []]);
+ObjC.bindFunction("umask", ["unsigned short", ["unsigned short"]]);
 ObjC.bindFunction("kill", ["int", ["int", "int"]]);
 ObjC.bindFunction("CFStringConvertIANACharSetNameToEncoding", ["unsigned int", ["id"]]);
 ObjC.bindFunction("CFStringConvertEncodingToNSStringEncoding", ["unsigned long", ["unsigned int"]]);
+
+// Everything this workflow writes (history, cached responses, curl's own files) is readable by this
+// user only: files 0600, folders 0700. Child processes (curl) inherit the mask.
+$.umask(0o077);
 
 const ENV = $.NSProcessInfo.processInfo.environment;
 function env(name, fallback) {
@@ -37,7 +44,7 @@ const MAX_MB = numberSetting("max_size", 10, 0.001, 1024); // response body limi
 const MAX_BYTES = Math.round(MAX_MB * 1024 * 1024);
 const FOLLOW = enabled("follow_redirects", true);
 const CONFIRM = enabled("confirm_writes", true);
-const KEEP_SECRETS = enabled("keep_secrets", true);
+const KEEP_SECRETS = enabled("keep_secrets", false); // secrets of recent requests go to the Keychain
 const HISTORY_MAX = 100;
 const SAVED_MAX = 200;
 const RESPONSES_MAX = 40; // cached response folders
@@ -185,9 +192,16 @@ function withLock(dir, fn) {
 
 // ---------- text ----------
 
+// s.slice(0, n) without splitting a surrogate pair (Alfred would show a lone half as �)
+function cut(s, n) {
+  s = String(s);
+  if (s.length <= n) return s;
+  const c = s.charCodeAt(n - 1);
+  return s.slice(0, c >= 0xd800 && c <= 0xdbff ? n - 1 : n);
+}
 function oneLine(s, max = 100) {
   s = String(s || "").replace(/\s+/g, " ").trim();
-  return s.length > max ? s.slice(0, max - 1).trimEnd() + "…" : s;
+  return s.length > max ? cut(s, max - 1).trimEnd() + "…" : s;
 }
 const capital = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
@@ -301,6 +315,169 @@ function maskBody(text) {
 function maskAuth(auth) {
   const i = auth.indexOf(":");
   return i >= 0 ? `${auth.slice(0, i)}:${DOTS}` : auth;
+}
+
+// The URL without its secrets: no password, and secret query parameters keep their name only
+function stripURL(url) {
+  const m = /^([a-z][a-z0-9+.-]*:\/\/)([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/i.exec(url);
+  if (!m) return url;
+  let [, scheme, authority, path, query, frag] = m;
+  const at = authority.lastIndexOf("@");
+  if (at >= 0) {
+    const userinfo = authority.slice(0, at), c = userinfo.indexOf(":");
+    if (c >= 0) authority = userinfo.slice(0, c) + authority.slice(at);
+  }
+  if (query) {
+    query = "?" + query.slice(1).split("&").map((p) => {
+      const i = p.indexOf("=");
+      return i > 0 && SECRET_PARAM.test(safeDecode(p.slice(0, i))) ? p.slice(0, i + 1) : p;
+    }).join("&");
+  }
+  return scheme + authority + path + (query || "") + (frag || "");
+}
+
+// ---------- secrets at rest ----------
+// History and saved requests are stored without their secrets ("pub"). The secrets (secret headers
+// with their positions, the password, a URL with a password or secret parameters, a body with secret
+// fields) go to the macOS Keychain: always for saved requests, for recent ones only with "Remember
+// secrets". pub.hidden lists the secret headers by name so they can be shown masked; pub.vault says
+// the Keychain has the rest. Secrets are read back only when a request is sent, reviewed or copied.
+
+function splitSecrets(req) {
+  const pub = Object.assign({}, req, { headers: [], hidden: [] });
+  delete pub.vault;
+  const sec = { headers: [] };
+  req.headers.forEach(([k, v], i) => {
+    if (isSecretHeader(k) && v !== "") {
+      sec.headers.push([i, k, v]);
+      pub.hidden.push([i, k]);
+    } else pub.headers.push([k, v]);
+  });
+  const colon = req.auth ? req.auth.indexOf(":") : -1;
+  if (colon >= 0 && colon < req.auth.length - 1) {
+    sec.auth = req.auth;
+    pub.auth = req.auth.slice(0, colon + 1);
+  }
+  const url = stripURL(req.url);
+  if (url !== req.url) {
+    sec.url = req.url;
+    pub.url = url;
+  }
+  if (req.body && req.body.kind === "multipart") {
+    if (req.body.fields.some(([k, v]) => SECRET_FIELD.test(k) && v !== "")) {
+      sec.fields = req.body.fields;
+      pub.body = Object.assign({}, req.body, { fields: req.body.fields.map(([k, v]) => [k, SECRET_FIELD.test(k) && v !== "" ? DOTS : v]) });
+    }
+  } else if (req.body) {
+    const masked = maskBody(req.body.text);
+    if (masked !== req.body.text) {
+      sec.body = req.body.text;
+      pub.body = Object.assign({}, req.body, { text: masked });
+    }
+  }
+  if (!sec.headers.length && !sec.auth && !sec.url && sec.body === undefined && !sec.fields) {
+    return { pub: Object.assign({}, req, { hidden: [], redacted: false, vault: false }), sec: null };
+  }
+  pub.redacted = true;
+  pub.vault = false;
+  return { pub, sec };
+}
+
+// pub + its secrets from the Keychain → the request as it was typed (null parts are left as they are)
+function mergeSecrets(pub, sec) {
+  if (!sec || typeof sec !== "object") return pub;
+  const r = Object.assign({}, pub, { headers: pub.headers.slice(), hidden: [], redacted: false, vault: false });
+  const hs = Array.isArray(sec.headers) ? sec.headers.filter((h) => Array.isArray(h) && Number.isInteger(h[0]) && typeof h[1] === "string" && typeof h[2] === "string") : [];
+  for (const [i, k, v] of hs.sort((a, b) => a[0] - b[0])) r.headers.splice(Math.min(i, r.headers.length), 0, [k, v]);
+  if (typeof sec.auth === "string") r.auth = sec.auth;
+  if (typeof sec.url === "string") r.url = sec.url;
+  if (r.body && typeof sec.body === "string" && r.body.kind !== "multipart") r.body = Object.assign({}, r.body, { text: sec.body });
+  if (r.body && Array.isArray(sec.fields) && r.body.kind === "multipart") r.body = Object.assign({}, r.body, { fields: sec.fields });
+  return cleanRequest(r) || pub;
+}
+
+// The headers as shown: secret ones that weren't loaded appear masked in their place
+function shownHeaders(req) {
+  const hs = req.headers.slice();
+  for (const [i, k] of (req.hidden || []).slice().sort((a, b) => a[0] - b[0])) hs.splice(Math.min(i, hs.length), 0, [k, DOTS]);
+  return hs;
+}
+
+// ---------- Keychain ----------
+// Security framework through the ObjC bridge (as in alfred-stocks), so secrets never appear in a
+// process's arguments. One generic password per request: service <bundleid>.history (account: the
+// response id) or <bundleid>.saved (account: the lower-cased name); the value is JSON.
+const KC_NOT_FOUND = -25300; // errSecItemNotFound
+const KC_HISTORY = "history", KC_SAVED = "saved";
+const VAULT_MAX = 256 * 1024;
+
+// test suite only: a folder stands in for the Keychain. In test mode there is no fallback to the real one.
+function kcTestDir() {
+  const d = env("HTTP_TEST_KEYCHAIN", "");
+  if (!d && testMode()) throw new Error("test mode needs HTTP_TEST_KEYCHAIN");
+  return d ? mkdirs(d, true) : "";
+}
+function kcTestPath(kind, acct) {
+  return `${kcTestDir()}/${kind}.${hash(acct)}`;
+}
+function kcQuery(kind, acct) {
+  const d = $.NSMutableDictionary.alloc.init;
+  d.setObjectForKey($("genp"), $("class"));
+  d.setObjectForKey($(`${BUNDLE}.${kind}`), $("svce"));
+  if (acct !== undefined) d.setObjectForKey($(acct), $("acct"));
+  return d;
+}
+function vaultGet(kind, acct) {
+  let text;
+  if (kcTestDir()) text = readFile(kcTestPath(kind, acct));
+  else {
+    const q = kcQuery(kind, acct);
+    q.setObjectForKey($.NSNumber.numberWithBool(true), $("r_Data"));
+    q.setObjectForKey($("m_LimitOne"), $("m_Limit"));
+    const r = Ref();
+    if ($.SecItemCopyMatching(q, r) !== 0 || !r[0]) return null;
+    const s = $.NSString.alloc.initWithDataEncoding(ObjC.castRefToObject(r[0]), $.NSUTF8StringEncoding);
+    text = s.isNil() ? null : s.js;
+  }
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch (e) {
+    return null;
+  }
+}
+function vaultSet(kind, acct, sec) {
+  const text = JSON.stringify(sec);
+  if (text.length > VAULT_MAX) return false;
+  if (kcTestDir()) return writeFile(kcTestPath(kind, acct), text);
+  const data = $(text).dataUsingEncoding($.NSUTF8StringEncoding);
+  const q = kcQuery(kind, acct);
+  const upd = $.NSMutableDictionary.alloc.init;
+  upd.setObjectForKey(data, $("v_Data"));
+  let status = $.SecItemUpdate(q, upd);
+  if (status === KC_NOT_FOUND) {
+    q.setObjectForKey(data, $("v_Data"));
+    q.setObjectForKey($(`HTTP request secrets (Alfred HTTP, ${kind})`), $("labl"));
+    status = $.SecItemAdd(q, null);
+  }
+  return status === 0;
+}
+function vaultDelete(kind, acct) {
+  if (kcTestDir()) return removeFile(kcTestPath(kind, acct));
+  $.SecItemDelete(kcQuery(kind, acct));
+}
+// every item of one kind (also any left behind by a damaged history file)
+function vaultClear(kind) {
+  const d = kcTestDir();
+  if (d) {
+    for (const f of listDir(d)) if (f.startsWith(`${kind}.`)) removeFile(`${d}/${f}`);
+    return;
+  }
+  for (let i = 0; i < 1000 && $.SecItemDelete(kcQuery(kind)) === 0; i++);
+}
+// A stored request with its secrets put back (when the Keychain has them)
+function withSecrets(req, kind, acct) {
+  if (!req || !req.vault) return req;
+  return mergeSecrets(req, vaultGet(kind, acct));
 }
 
 // ---------- URLs ----------
@@ -421,6 +598,8 @@ function cleanRequest(r) {
     notes: Array.isArray(r.notes) ? r.notes.filter((n) => typeof n === "string").slice(0, 5) : [],
     redacted: r.redacted === true,
     bodyDropped: r.bodyDropped === true,
+    hidden: Array.isArray(r.hidden) ? r.hidden.filter((h) => Array.isArray(h) && Number.isInteger(h[0]) && h[0] >= 0 && typeof h[1] === "string" && validHeader(h[1], "")) : [],
+    vault: r.vault === true,
   };
 }
 function validHeader(name, value) {
@@ -436,6 +615,87 @@ function finishRequest(req) {
   }
   return req;
 }
+
+// ---------- nested JSON fields (HTTPie 3) ----------
+// search[type]=id search[id]:=1 → {"search": {"type": "id", "id": 1}} · tags[]=a tags[]=b → {"tags": ["a", "b"]}
+// items[1]=x fills items[0] with null · [0][name]=x → a top-level array · \[ \] \\ escape · [\1] is the key "1"
+
+function keyPath(key) {
+  let i = 0, top = "";
+  while (i < key.length && key[i] !== "[") {
+    if (key[i] === "\\" && i + 1 < key.length) {
+      top += key[i + 1];
+      i += 2;
+    } else top += key[i++];
+  }
+  const segs = [];
+  while (i < key.length) {
+    if (key[i] !== "[") throw new ParseError(`${oneLine(key, 30)}: expected “[” after “${oneLine(key.slice(0, i), 20)}”`);
+    let j = i + 1, text = "", escaped = false;
+    while (j < key.length && key[j] !== "]") {
+      if (key[j] === "\\" && j + 1 < key.length) {
+        text += key[j + 1];
+        escaped = true;
+        j += 2;
+      } else text += key[j++];
+    }
+    if (j >= key.length) throw new ParseError(`${oneLine(key, 30)}: a “]” is missing`);
+    if (text === "" && !escaped) segs.push({ append: true });
+    else if (/^\d+$/.test(text) && !escaped) {
+      if (Number(text) > 10000) throw new ParseError(`${oneLine(key, 30)}: the index is too large`);
+      segs.push({ index: Number(text) });
+    } else segs.push({ key: text });
+    i = j + 1;
+  }
+  return top !== "" || !segs.length ? [{ key: top }, ...segs] : segs;
+}
+const jnode = (t) => (t === "obj" ? { t, keys: new Map() } : { t, items: [] });
+function jfrom(v) {
+  if (Array.isArray(v)) return { t: "arr", items: v.map(jfrom) };
+  if (v && typeof v === "object") return { t: "obj", keys: new Map(Object.keys(v).map((k) => [k, jfrom(v[k])])) };
+  return { t: "leaf", json: JSON.stringify(v) };
+}
+function jtext(n) {
+  if (!n) return "null";
+  if (n.t === "leaf") return n.json;
+  if (n.t === "arr") return `[${n.items.map(jtext).join(", ")}]`;
+  return `{${[...n.keys].map(([k, v]) => `${JSON.stringify(k)}: ${jtext(v)}`).join(", ")}}`;
+}
+function nestedJSON(fields) {
+  let root = null;
+  for (const [key, value, raw] of fields) {
+    const path = keyPath(key);
+    const leaf = { t: "leaf", json: raw ? value.trim() : JSON.stringify(value) };
+    const want = (seg) => (seg.key !== undefined ? "obj" : "arr");
+    if (!root) root = jnode(want(path[0]));
+    let cur = root;
+    path.forEach((seg, n) => {
+      if (cur.t !== want(seg)) {
+        const what = seg.key !== undefined ? `[${seg.key}]` : seg.append ? "[]" : `[${seg.index}]`;
+        throw new ParseError(`${oneLine(key, 30)}: can’t use ${what} on ${cur.t === "arr" ? "an array" : "an object"}`);
+      }
+      const last = n === path.length - 1;
+      const get = () => (cur.t === "obj" ? cur.keys.get(seg.key) : seg.append ? undefined : cur.items[seg.index]);
+      let child = get();
+      if (last) child = leaf;
+      else {
+        if (child && child.t === "leaf" && /^[\[{]/.test(child.json)) child = jfrom(JSON.parse(child.json)); // a:=[1] a[]=2
+        if (!child || child.t === "leaf") child = jnode(want(path[n + 1]));
+      }
+      if (cur.t === "obj") cur.keys.set(seg.key, child);
+      else if (seg.append) cur.items.push(child);
+      else {
+        while (cur.items.length < seg.index) cur.items.push(null);
+        cur.items[seg.index] = child;
+      }
+      cur = child;
+    });
+  }
+  return jtext(root);
+}
+// a key with an unescaped [ is a nested path; \[ \] \\ are only escapes
+const isNestedKey = (k) => /(^|[^\\])(\\\\)*\[/.test(k);
+const unescapeKey = (k) => k.replace(/\\([\\\[\]])/g, "$1");
 
 // ---------- request line ----------
 // get api.github.com/users/octocat   ·   post httpbin.org/post {"a":1}   ·   https://…  H:Authorization=Bearer x
@@ -495,10 +755,11 @@ function parseLine(q) {
   if (i >= toks.length) throw new ParseError(`Type a URL after ${method}`);
   const req = { method: null, url: normalizeURL(toks[i].text), headers: [], body: null, auth: null, insecure: false, notes: [] };
   const query = [], fields = [];
-  let raw = null, form = false, forceJSON = false, last = null;
+  let raw = null, form = false, forceJSON = false, last = null, authType = "basic", authVal = null;
   for (let j = i + 1; j < toks.length; j++) {
     const t = toks[j], s = t.text;
-    if (/^[{\[]/.test(q[t.start])) {
+    let m;
+    if (/^[{\[]/.test(q[t.start]) && !/^(\[[^\]\s]*\])+:?=/.test(s)) { // [0][name]=x is a field
       if (fields.length) throw new ParseError("Use either fields (k=v) or a body, not both");
       raw = q.slice(t.start).trim(); // a JSON body runs to the end, spaces and quotes included
       break;
@@ -528,9 +789,16 @@ function parseLine(q) {
       last = null;
       continue;
     }
-    if (!t.quoted && /^(-u|-a|--auth|--user)$/.test(s)) {
-      if (j + 1 >= toks.length) throw new ParseError(`Type user:password after ${s}`);
-      req.auth = withPassword(toks[++j].text, req.notes);
+    if (!t.quoted && (m = /^(-A|--auth-type)(?:=(.*))?$/.exec(s))) { // HTTPie: -A bearer -a <token>
+      if (m[2] === undefined && j + 1 >= toks.length) throw new ParseError(`Type basic or bearer after ${s}`);
+      authType = (m[2] !== undefined ? m[2] : toks[++j].text).toLowerCase();
+      if (authType !== "basic" && authType !== "bearer") throw new ParseError(`${oneLine(authType, 20)} authentication isn’t supported: use basic or bearer`);
+      last = null;
+      continue;
+    }
+    if (!t.quoted && (m = /^(-u|-a|--auth|--user)(?:=(.*))?$/.exec(s)) && (m[2] === undefined || m[1].startsWith("--"))) {
+      if (m[2] === undefined && j + 1 >= toks.length) throw new ParseError(`Type user:password after ${s}`);
+      authVal = m[2] !== undefined ? m[2] : toks[++j].text;
       last = null;
       continue;
     }
@@ -542,7 +810,11 @@ function parseLine(q) {
       req.headers.push(last);
       continue;
     }
-    let m;
+    if (!t.quoted && (m = /^([A-Za-z0-9!#$%&'*+.^_`|~-]+);$/.exec(s))) { // HTTPie: Name; sends an empty header
+      req.headers.push([m[1], ""]);
+      last = null;
+      continue;
+    }
     if ((m = /^([HhQq]):([^=:\s]+)[=:]([\s\S]*)$/.exec(s))) {
       last = [m[2], m[3].trim()];
       (m[1].toUpperCase() === "H" ? req.headers : query).push(last);
@@ -580,7 +852,7 @@ function parseLine(q) {
   if (fields.length) {
     if (form) {
       if (fields.some((f) => f[2] === "raw")) throw new ParseError("Raw JSON fields (k:=…) can’t be sent as a form");
-      req.body = { kind: "form", text: fields.map(([k, v]) => `${enc(k)}=${enc(v)}`).join("&") };
+      req.body = { kind: "form", text: fields.map(([k, v]) => `${enc(unescapeKey(k))}=${enc(v)}`).join("&") };
     } else {
       for (const f of fields) {
         if (f[2] === "raw") {
@@ -588,7 +860,11 @@ function parseLine(q) {
           if (err) throw new ParseError(`${f[0]}:= needs valid JSON (${err})`);
         }
       }
-      req.body = { kind: "json", text: "{" + fields.map(([k, v, r]) => `${JSON.stringify(k)}: ${r ? v.trim() : JSON.stringify(v)}`).join(", ") + "}" };
+      req.body = {
+        kind: "json",
+        text: fields.some(([k]) => isNestedKey(k)) ? nestedJSON(fields)
+          : "{" + fields.map(([k, v, r]) => `${JSON.stringify(unescapeKey(k))}: ${r ? v.trim() : JSON.stringify(v)}`).join(", ") + "}",
+      };
     }
   } else if (raw !== null) {
     const kind = forceJSON ? "json" : form ? "form" : bodyKind(raw, header(req, "Content-Type"));
@@ -605,6 +881,10 @@ function parseLine(q) {
     } else if (req.body.kind === "form") setDefaultHeader(req, "Content-Type", "application/x-www-form-urlencoded");
     else setDefaultHeader(req, "Content-Type", "text/plain; charset=utf-8");
   } else if (forceJSON) setDefaultHeader(req, "Accept", "application/json, */*;q=0.5");
+  if (authVal !== null && authType === "bearer") {
+    if (header(req, "Authorization") !== null) throw new ParseError("Use either -A bearer or an Authorization header, not both");
+    req.headers.push(["Authorization", `Bearer ${authVal}`]);
+  } else if (authVal !== null) req.auth = withPassword(authVal, req.notes);
   req.method = method || (req.body ? "POST" : "GET");
   if (req.body && (req.method === "GET" || req.method === "HEAD")) req.notes.push(`${req.method} with a body: many servers ignore it`);
   return finishRequest(req);
@@ -804,7 +1084,11 @@ function curlWords(text) {
   return bashWords(t);
 }
 
-// Options that take a value (from `curl --help all`, curl 8.7, plus newer ones)
+// Options that take a value: every option of the curl 8.21 man page (curl.se/docs/manpage.html,
+// checked 2026-09-28) whose synopsis has an argument. A pasted command is never run: it is parsed
+// into a request, and only that request is turned into curl options, so no option here can make
+// curl read or write a file. The list only has to be complete so that an option's value is never
+// mistaken for the URL.
 const CURL_ARG = new Set(("abstract-unix-socket alt-svc aws-sigv4 cacert capath cert cert-type ciphers config connect-timeout connect-to " +
   "continue-at cookie cookie-jar create-file-mode crlfile curves data data-ascii data-binary data-raw data-urlencode delegation " +
   "dns-interface dns-ipv4-addr dns-ipv6-addr dns-servers doh-url dump-header egd-file engine etag-compare etag-save expect100-timeout " +
@@ -817,7 +1101,8 @@ const CURL_ARG = new Set(("abstract-unix-socket alt-svc aws-sigv4 cacert capath 
   "request-target resolve retry retry-delay retry-max-time sasl-authzid service-name socks4 socks4a socks5 socks5-gssapi-service " +
   "socks5-hostname speed-limit speed-time stderr telnet-option tftp-blksize time-cond tls-max tls13-ciphers tlsauthtype tlspassword " +
   "tlsuser trace trace-ascii trace-config unix-socket upload-file url url-query user user-agent variable write-out proxy preproxy " +
-  "ech ip-tos vlan-priority sigalgs upload-flags knownhosts").split(" "));
+  "ech ip-tos vlan-priority sigalgs upload-flags knownhosts httpsig-algo httpsig-headers httpsig-key httpsig-keyid keepalive-cnt " +
+  "parallel-max-host ssl-sessions").split(" "));
 const CURL_SHORT_ARG = { E: "cert", K: "config", C: "continue-at", b: "cookie", c: "cookie-jar", d: "data", D: "dump-header", F: "form", P: "ftp-port", H: "header", h: "help", m: "max-time", o: "output", U: "proxy-user", Q: "quote", r: "range", e: "referer", X: "request", Y: "speed-limit", y: "speed-time", t: "telnet-option", z: "time-cond", T: "upload-file", u: "user", A: "user-agent", w: "write-out", x: "proxy" };
 const CURL_SHORT_FLAG = { a: "append", q: "disable", f: "fail", G: "get", g: "globoff", I: "head", 0: "http1.0", i: "include", k: "insecure", 4: "ipv4", 6: "ipv6", j: "junk-session-cookies", l: "list-only", L: "location", M: "manual", n: "netrc", N: "no-buffer", Z: "parallel", p: "proxytunnel", J: "remote-header-name", O: "remote-name", R: "remote-time", S: "show-error", s: "silent", 2: "sslv2", 3: "sslv3", 1: "tlsv1", B: "use-ascii", v: "verbose", V: "version", "#": "progress-bar", ":": "next" };
 const CURL_KNOWN_FLAGS = new Set(("anyauth append basic ca-native compressed compressed-ssh create-dirs crlf digest disable disable-eprt disable-epsv " +
@@ -830,9 +1115,16 @@ const CURL_KNOWN_FLAGS = new Set(("anyauth append basic ca-native compressed com
   "remote-header-name remote-name remote-name-all remote-time remove-on-error retry-all-errors retry-connrefused sasl-ir show-error " +
   "show-headers silent skip-existing socks5-basic socks5-gssapi socks5-gssapi-nec ssl ssl-allow-beast ssl-auto-client-cert ssl-no-revoke " +
   "ssl-reqd ssl-revoke-best-effort sslv2 sslv3 styled-output suppress-connect-headers tcp-fastopen tcp-nodelay tftp-no-options " +
-  "tlsv1 tlsv1.0 tlsv1.1 tlsv1.2 tlsv1.3 tr-encoding trace-ids trace-time use-ascii verbose version xattr").split(" "));
+  "tlsv1 tlsv1.0 tlsv1.1 tlsv1.2 tlsv1.3 tr-encoding trace-ids trace-time use-ascii verbose version xattr cert-status dump-ca-embed " +
+  "ftp-ssl-ccc metalink proxy-http3 tls-earlydata").split(" "));
+// Options about files the command would read or write: ignored, and said so once
+const CURL_FILE_OPTS = new Set(("output output-dir dump-header cookie-jar trace trace-ascii libcurl stderr etag-save etag-compare hsts " +
+  "alt-svc ssl-sessions cacert capath crlfile proxy-cacert proxy-capath proxy-crlfile random-file egd-file knownhosts proxy-cert " +
+  "proxy-key remote-name remote-name-all remote-header-name create-dirs").split(" "));
+const CURL_AUTH_FLAGS = new Set(["digest", "ntlm", "ntlm-wb", "negotiate", "anyauth"]);
 
 const LOCAL_FILE = "reads a local file, which isn’t supported";
+const FILES_NOTE = "Ignored the files the command reads or writes (-o, -D, -c…): the response opens in Alfred";
 
 function parseCurl(text) {
   const { words, notes: wordNotes } = curlWords(text);
@@ -944,21 +1236,42 @@ function parseCurl(text) {
       case "key":
         notes.add("Ignored the client certificate");
         return;
+      case "aws-sigv4":
+        notes.add("Ignored --aws-sigv4: the request isn’t signed");
+        return;
+      case "httpsig-key":
+        notes.add("Ignored HTTP message signing (--httpsig-key)");
+        return;
+      case "request-target":
+        notes.add("Ignored --request-target");
+        return;
       default:
-        return; // output, write-out, max-time… don't change what is sent
+        if (CURL_FILE_OPTS.has(name)) notes.add(FILES_NOTE);
+        return; // write-out, max-time… don't change what is sent
     }
   };
+  let unknown = null; // an unknown option just before a word: that word might be its value, not a URL
+  const suspicious = new Map();
   const flag = (name) => {
     if (name === "get") get = true;
     else if (name === "head") head = true;
     else if (name === "insecure") insecure = true;
     else if (name === "next") notes.add("Only the first request is used");
-    else if (!CURL_KNOWN_FLAGS.has(name.replace(/^no-/, "")) && !CURL_KNOWN_FLAGS.has(name)) notes.add(`Ignored --${oneLine(name, 20)}`);
+    else if (CURL_FILE_OPTS.has(name)) notes.add(FILES_NOTE);
+    else if (CURL_AUTH_FLAGS.has(name)) authType = name;
+    else if (name === "netrc" || name === "netrc-optional") notes.add("Ignored --netrc: passwords aren’t read from ~/.netrc");
+    else if (!CURL_KNOWN_FLAGS.has(name.replace(/^no-/, "")) && !CURL_KNOWN_FLAGS.has(name)) {
+      notes.add(`Ignored --${oneLine(name, 20)}`);
+      unknown = `--${oneLine(name, 20)}`;
+    }
   };
-  let endOpts = false;
+  let endOpts = false, authType = null;
   for (let i = 1; i < words.length; i++) {
     const w = words[i];
+    const after = unknown;
+    unknown = null;
     if (endOpts || !w.startsWith("-") || w === "-") {
+      if (after && !endOpts) suspicious.set(urls.length, after);
       urls.push(w);
       continue;
     }
@@ -988,11 +1301,16 @@ function parseCurl(text) {
         break;
       }
       if (Object.prototype.hasOwnProperty.call(CURL_SHORT_FLAG, ch)) flag(CURL_SHORT_FLAG[ch]);
-      else notes.add(`Ignored -${ch}`);
+      else {
+        notes.add(`Ignored -${ch}`);
+        unknown = `-${ch}`;
+      }
     }
   }
   if (!urls.length) fail("The curl command has no URL");
+  if (suspicious.has(0)) fail(`Unknown option ${suspicious.get(0)}: is “${oneLine(urls[0], 30)}” its value or the URL?`);
   if (urls.length > 1) notes.add("Only the first URL is used");
+  if (authType && auth !== null) notes.add(`Sent with basic authentication (--${authType} isn’t supported)`);
   // curl adds http:// to a URL without a scheme
   let url = normalizeURL(urls[0], /^[a-z][a-z0-9+.-]*:\/\//i.test(urls[0]) ? null : "http");
   url = addQuery(url, urlQuery);
@@ -1290,6 +1608,32 @@ function cfgText(s) {
 
 const WRITE_OUT = "%{stderr}\\n@@alfred-http@@ %{http_code} %{http_version} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_pretransfer} %{time_starttransfer} %{time_total} %{size_download} %{num_redirects} %{exitcode} %{remote_ip}\\n@@url@@ %{url_effective}\\n@@err@@ %{errormsg}\\n";
 
+// The proxy set in System Settings › Network, which curl doesn't read by itself: HTTP, HTTPS or SOCKS
+// (a PAC file or a proxy that needs a password isn't supported). Local addresses never use it.
+function systemProxy(url) {
+  const t = env("HTTP_TEST_PROXY", null); // test suite only: host:port of an HTTP proxy, or ""
+  let d;
+  if (t !== null) d = t ? { HTTPEnable: 1, HTTPProxy: t.split(":")[0], HTTPPort: Number(t.split(":")[1]), ExceptionsList: ["*.test"] } : {};
+  else if (testMode()) return null;
+  else {
+    const ref = $.CFNetworkCopySystemProxySettings();
+    d = ref ? ObjC.deepUnwrap(ObjC.castRefToObject(ref)) : null;
+  }
+  if (!d || typeof d !== "object") return null;
+  const https = /^https:/i.test(url);
+  const valid = (h) => typeof h === "string" && /^[A-Za-z0-9.\-:]{1,253}$/.test(h);
+  const hostPart = (h) => (h.includes(":") ? `[${h}]` : h);
+  let proxy = null;
+  const [en, host, port] = https ? ["HTTPSEnable", "HTTPSProxy", "HTTPSPort"] : ["HTTPEnable", "HTTPProxy", "HTTPPort"];
+  if (Number(d[en]) === 1 && valid(d[host])) proxy = `http://${hostPart(d[host])}:${Number(d[port]) || 80}`;
+  else if (Number(d.SOCKSEnable) === 1 && valid(d.SOCKSProxy)) proxy = `socks5h://${hostPart(d.SOCKSProxy)}:${Number(d.SOCKSPort) || 1080}`;
+  if (!proxy) return null;
+  const ex = (Array.isArray(d.ExceptionsList) ? d.ExceptionsList : [])
+    .map((e) => String(e).trim().replace(/^\*\./, ".")) // *.example.com → .example.com (curl's syntax)
+    .filter((e) => /^[A-Za-z0-9.\-:\/\[\]]{1,253}$/.test(e));
+  return { proxy, noproxy: ["localhost", "127.0.0.1", "::1", ...ex].join(",") };
+}
+
 function curlConfig(req, dir) {
   const L = [
     `url = ${cfg(req.url)}`, "globoff", "silent", "show-error", "compressed",
@@ -1298,6 +1642,8 @@ function curlConfig(req, dir) {
     `max-filesize = ${MAX_BYTES}`, `dump-header = ${cfg(`${dir}/headers.txt`)}`, `write-out = "${WRITE_OUT}"`,
   ];
   if (FOLLOW) L.push("location", "max-redirs = 10");
+  const px = systemProxy(req.url);
+  if (px) L.push(`proxy = ${cfg(px.proxy)}`, `noproxy = ${cfg(px.noproxy)}`);
   if (req.method === "HEAD") L.push("head");
   else if (!(req.method === "GET" && !req.body) && !(req.method === "POST" && req.body)) L.push(`request = ${cfg(req.method)}`);
   if (header(req, "User-Agent") === null) L.push(`user-agent = ${cfg(UA)}`);
@@ -1446,6 +1792,81 @@ function looksBinary(data) {
 // a Map: the Content-Type comes from the server ("constructor" must not find Object.prototype)
 const IMAGE_EXT = new Map(Object.entries({ "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/gif": "gif", "image/webp": "webp", "image/svg+xml": "svg", "image/heic": "heic", "image/bmp": "bmp", "image/tiff": "tiff", "image/x-icon": "ico", "image/vnd.microsoft.icon": "ico", "image/avif": "avif" }));
 
+// ---------- Quick Look of HTML and SVG ----------
+// Quick Look renders HTML and SVG with WebKit and loads their remote images, style sheets and frames
+// (it doesn't run scripts, and it ignores a Content-Security-Policy <meta>). So a response is never
+// previewed as it came: HTML is rebuilt from a whitelist of elements with no attributes, styles,
+// scripts or links, and SVG is shown through an <img> with a data: URL (no scripts, nothing loaded).
+
+const QL_KEEP = new Set(("a abbr address article aside b bdi blockquote br caption center cite code dd del details dfn div dl dt em " +
+  "figcaption figure footer h1 h2 h3 h4 h5 h6 header hr i ins kbd li main mark nav ol p pre q s samp section small span strong sub " +
+  "summary sup table tbody td tfoot th thead time tr u ul var").split(" "));
+const QL_DROP = new Set(("script style head title noscript template iframe frame frameset object embed applet svg math video audio " +
+  "canvas picture source track map link meta base input select option textarea button").split(" "));
+const QL_MAX = 512 * 1024; // characters of HTML rebuilt; the rest is left out of the preview
+const QL_STYLE = "body{font:13px -apple-system,sans-serif;margin:16px;color:#222;background:#fff}" +
+  "pre,code,kbd,samp{font:12px ui-monospace,Menlo,monospace}pre{white-space:pre-wrap}table{border-collapse:collapse}" +
+  "td,th{border:1px solid #ccc;padding:2px 6px}img{max-width:100%}.alfred-http-note{color:#888;font-size:11px;" +
+  "border-bottom:1px solid #ddd;padding-bottom:6px;margin-bottom:12px}" +
+  "@media (prefers-color-scheme:dark){body{background:#1e1e1e;color:#ddd}td,th{border-color:#555}}";
+
+function escHTML(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function qlPage(body, note) {
+  return `<!doctype html><html><head><meta charset="utf-8"><style>${QL_STYLE}</style></head><body><div class="alfred-http-note">${escHTML(note)}</div>${body}</body></html>`;
+}
+function qlAttr(node, name) {
+  const a = node.attributeForName(name);
+  return a.isNil() ? "" : String(a.stringValue.js || "");
+}
+function qlWalk(node, out, depth) {
+  if (depth > 256 || out.length > 400000) return;
+  const kind = Number(node.kind); // an NSUInteger: the bridge may hand it over as a string
+  if (kind === 7) return void out.push(escHTML(node.stringValue.js || "")); // text
+  if (kind !== 2) return; // not an element: comments, processing instructions… are left out
+  const name = String(node.name.js || "").toLowerCase();
+  if (QL_DROP.has(name)) return;
+  if (name === "img") {
+    const src = qlAttr(node, "src"), alt = qlAttr(node, "alt");
+    if (/^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=\s]+$/i.test(src)) out.push(`<img src="${escHTML(src)}" alt="${escHTML(alt)}">`);
+    else if (alt.trim()) out.push(`[${escHTML(alt.trim())}]`);
+    return;
+  }
+  const keep = QL_KEEP.has(name);
+  if (keep) {
+    let attrs = "";
+    if (name === "td" || name === "th") {
+      for (const a of ["colspan", "rowspan"]) {
+        const v = qlAttr(node, a);
+        if (/^\d{1,3}$/.test(v)) attrs += ` ${a}="${v}"`;
+      }
+    }
+    out.push(`<${name}${attrs}>`);
+  }
+  const ch = node.children;
+  if (!ch.isNil()) {
+    const n = Number(ch.count);
+    for (let i = 0; i < n; i++) qlWalk(ch.objectAtIndex(i), out, depth + 1);
+  }
+  if (keep && name !== "br" && name !== "hr") out.push(`</${name}>`);
+}
+// HTML → a page Quick Look can show without loading or running anything
+function safeHTML(html) {
+  const src = cut(String(html), QL_MAX);
+  // NSXMLDocumentTidyHTML | NSXMLNodeLoadExternalEntitiesNever (a DOCTYPE must not fetch its DTD)
+  const doc = $.NSXMLDocument.alloc.initWithXMLStringOptionsError($(src), (1 << 9) | (1 << 19), $());
+  const note = `Preview without scripts, styles, links or remote content${src.length < html.length ? " (the start of the page)" : ""}`;
+  if (doc.isNil() || doc.rootElement.isNil()) return qlPage(`<pre>${escHTML(src)}</pre>`, note);
+  const out = [];
+  qlWalk(doc.rootElement, out, 0);
+  return qlPage(out.join(""), note);
+}
+function safeSVG(data) {
+  const b64 = data.base64EncodedStringWithOptions(0).js;
+  return qlPage(`<img src="data:image/svg+xml;base64,${b64}" alt="SVG image">`, "SVG shown as an image: no scripts, nothing loaded");
+}
+
 // Name the body file for Quick Look and build the preview (pretty JSON, transcoded text)
 function describeBody(dir, contentType, method, status) {
   const tmp = `${dir}/body.tmp`;
@@ -1490,13 +1911,17 @@ function describeBody(dir, contentType, method, status) {
       res.kind = kind;
       let preview = null;
       if (kind === "json" && size <= PRETTY_MAX && !jsonError(t)) preview = prettyJSON(t);
-      else if (dec.encoding !== "UTF-8" && size <= PRETTY_MAX) preview = kind === "html" ? `<meta charset="utf-8">\n${text}` : text;
+      else if (dec.encoding !== "UTF-8" && size <= PRETTY_MAX) preview = text;
       if (preview !== null) {
         writeFile(`${dir}/preview.${ext}`, preview);
         res.previewFile = `${dir}/preview.${ext}`;
         text = preview;
       }
-      res.previewText = text.slice(0, 4000);
+      res.previewText = cut(text, 4000);
+      if (kind === "html") {
+        writeFile(`${dir}/quicklook.html`, safeHTML(text));
+        res.quicklookFile = `${dir}/quicklook.html`;
+      }
       res.lines = size <= PRETTY_MAX ? (text.match(/\n/g) || []).length + 1 : 0;
       res.truncatedPreview = size > PRETTY_MAX;
     }
@@ -1508,6 +1933,10 @@ function describeBody(dir, contentType, method, status) {
   if (!res.previewFile) res.previewFile = body;
   if (kind === "binary") res.previewText = `Binary data · ${fmtBytes(size)}${mime ? ` · ${mime}` : ""}`;
   if (kind === "image" || kind === "pdf") res.previewText = `${kind === "pdf" ? "PDF" : "Image"} · ${fmtBytes(size)} · ${mime || ext}`;
+  if (ext === "svg" && size <= PRETTY_MAX) {
+    writeFile(`${dir}/quicklook.html`, safeSVG(data));
+    res.quicklookFile = `${dir}/quicklook.html`;
+  }
   return res;
 }
 
@@ -1516,17 +1945,23 @@ function sendNow(rid, detached) {
   if (!RID_RE.test(rid)) return;
   if (detached) $.setsid(); // leave Alfred's process group: a new Alfred query must not kill the request
   const dir = respDir(rid);
-  const req = cleanRequest(readJSON(`${dir}/request.json`, null));
+  // the full request (with its secrets) is handed over in send.json, which is read once and deleted
+  const full = readJSON(`${dir}/send.json`, null);
+  removeFile(`${dir}/send.json`);
+  const req = cleanRequest(full) || loadRef(`resp:${rid}`);
   const started = now();
-  const meta = { rid, t: started, method: req ? req.method : "", url: req ? req.url : "", status: 0, error: null, headers: [], redirects: [] };
+  const meta = { rid, t: started, method: req ? req.method : "", url: req ? stripURL(req.url) : "", status: 0, error: null, headers: [], redirects: [] };
   writeFile(`${dir}/pid`, String(PID));
   try {
     if (!req) throw Object.assign(new Error("The stored request is damaged"), { code: -1 });
     const r = runCurl(req, dir);
     const err = readFile(`${dir}/stderr.txt`) || "";
+    const dumped = readText(`${dir}/headers.txt`);
+    removeFile(`${dir}/stderr.txt`); // they hold the effective URL and Set-Cookie: meta.json keeps what is shown
+    removeFile(`${dir}/headers.txt`);
     const wo = /@@alfred-http@@ (\d{3}) (\S+) ([\d.]+) ([\d.]+) ([\d.]+) ([\d.]+) ([\d.]+) ([\d.]+) (\d+) (\d+) (\d+) ?(\S*)/.exec(err);
     const url = /@@url@@ (.*)/.exec(err), emsg = /@@err@@ (.*)/.exec(err);
-    const dump = parseHeaderDump(readText(`${dir}/headers.txt`));
+    const dump = parseHeaderDump(dumped);
     if (dump.final) {
       meta.status = dump.final.status;
       meta.reason = dump.final.reason || statusName(dump.final.status);
@@ -1539,7 +1974,7 @@ function sendNow(rid, detached) {
       meta.timing = { dns, connect: Math.max(0, conn - dns), tls: tls > 0 ? Math.max(0, tls - conn) : 0, ttfb: start, total };
       if (!meta.status && Number(wo[1])) meta.status = Number(wo[1]);
       meta.remoteIP = wo[12] || "";
-      meta.effectiveURL = url ? url[1].trim() : req.url;
+      meta.effectiveURL = stripURL(url ? url[1].trim() : req.url);
     }
     const code = r.truncated ? 63 : wo ? Number(wo[11]) : r.exit;
     if (r.truncated) meta.truncated = true;
@@ -1563,7 +1998,6 @@ function sendNow(rid, detached) {
   meta.done = now();
   writeFile(`${dir}/meta.json`, JSON.stringify(meta));
   removeFile(`${dir}/pid`);
-  if (!KEEP_SECRETS) writeFile(`${dir}/request.json`, JSON.stringify(redactRequest(req || {})));
   updateHistory(rid, meta);
   return meta;
 }
@@ -1588,24 +2022,6 @@ const stashDir = () => mkdirs(`${cacheDir()}/req`, true);
 const outDir = () => mkdirs(`${cacheDir()}/out`, true);
 const STASH_RE = /^[0-9a-f]{14}$/;
 
-// Without "Remember secrets", history keeps the request but drops secret headers and the password
-function redactRequest(req) {
-  const r = JSON.parse(JSON.stringify(req));
-  if (!Array.isArray(r.headers)) return r;
-  const dropped = r.headers.filter(([k]) => isSecretHeader(k)).map(([k]) => k);
-  r.headers = r.headers.filter(([k]) => !isSecretHeader(k));
-  if (typeof r.auth === "string" && r.auth.includes(":")) {
-    r.auth = r.auth.slice(0, r.auth.indexOf(":") + 1);
-    dropped.push("password");
-  }
-  if (typeof r.url === "string" && /^https?:\/\/[^/?#@]*:[^/?#@]*@/i.test(r.url)) {
-    r.url = r.url.replace(/^(https?:\/\/[^/?#@:]*):[^/?#@]*@/i, "$1@");
-    dropped.push("password");
-  }
-  if (dropped.length) r.redacted = true;
-  return r;
-}
-
 function loadHistory() {
   const h = readJSON(historyPath(), { items: [] });
   return (Array.isArray(h.items) ? h.items : [])
@@ -1618,15 +2034,23 @@ function saveHistory(items) {
 const historyLock = () => `${cacheDir()}/history.lock`;
 // history.json is read on every keystroke of the home view: a huge body stays in the response folder only
 const HISTORY_REQ_MAX = 256 * 1024;
+// Adds a request to the history without its secrets (they go to the Keychain with "Remember secrets").
+// Returns the request as stored for its response folder (pub, with the body).
 function addHistory(rid, req) {
+  const { pub, sec } = splitSecrets(req);
+  const stored = sec && KEEP_SECRETS && vaultSet(KC_HISTORY, rid, sec) ? Object.assign({}, pub, { vault: true }) : pub;
+  const kept = JSON.stringify(stored).length > HISTORY_REQ_MAX ? Object.assign({}, stored, { body: null, bodyDropped: true }) : stored;
+  const fp = fingerprint(pub); // of the request without secrets: a hash must not help guess a password
+  const gone = [];
   withLock(historyLock(), () => {
-    const fp = fingerprint(req);
-    const items = loadHistory().filter((e) => e.fp !== fp);
-    let kept = KEEP_SECRETS ? req : redactRequest(req);
-    if (JSON.stringify(kept).length > HISTORY_REQ_MAX) kept = Object.assign({}, kept, { body: null, bodyDropped: true });
+    const all = loadHistory();
+    const items = all.filter((e) => e.fp !== fp);
     items.unshift({ id: rid, t: now(), fp, req: kept, status: 0 });
+    gone.push(...all.filter((e) => e.fp === fp), ...items.slice(HISTORY_MAX));
     saveHistory(items);
   });
+  for (const e of gone) if (e.req.vault) vaultDelete(KC_HISTORY, e.id);
+  return stored;
 }
 function updateHistory(rid, meta) {
   withLock(historyLock(), () => {
@@ -1650,19 +2074,32 @@ function loadSaved() {
 function validName(name) {
   return name.length >= 1 && name.length <= 60 && !/[\x00-\x1f\x7f]/.test(name);
 }
+// Saved requests keep their secrets in the Keychain (whatever "Remember secrets" says: saving is explicit).
+// Returns "full", "partial" (the Keychain refused the secrets) or "" (too many saved requests).
 function saveNamed(name, req) {
+  const acct = name.toLowerCase();
   return withLock(`${cacheDir()}/saved.lock`, () => {
-    const items = loadSaved().filter((e) => e.name.toLowerCase() !== name.toLowerCase());
-    if (items.length >= SAVED_MAX) return false;
-    items.unshift({ name, t: now(), req });
-    return writeFile(savedPath(), JSON.stringify({ version: 1, items }));
+    const items = loadSaved().filter((e) => e.name.toLowerCase() !== acct);
+    if (items.length >= SAVED_MAX) return "";
+    const { pub, sec } = splitSecrets(req);
+    let kept = pub, result = "full";
+    if (!sec) vaultDelete(KC_SAVED, acct);
+    else if (vaultSet(KC_SAVED, acct, sec)) kept = Object.assign({}, pub, { vault: true });
+    else {
+      vaultDelete(KC_SAVED, acct);
+      result = "partial";
+    }
+    items.unshift({ name, t: now(), req: kept });
+    return writeFile(savedPath(), JSON.stringify({ version: 1, items })) ? result : "";
   });
 }
 function removeNamed(name) {
+  const acct = name.toLowerCase();
   return withLock(`${cacheDir()}/saved.lock`, () => {
     const all = loadSaved();
-    const items = all.filter((e) => e.name.toLowerCase() !== name.toLowerCase());
+    const items = all.filter((e) => e.name.toLowerCase() !== acct);
     if (items.length === all.length) return false;
+    vaultDelete(KC_SAVED, acct);
     return writeFile(savedPath(), JSON.stringify({ version: 1, items }));
   });
 }
@@ -1678,6 +2115,11 @@ function reqVars(req) {
   const p = `${stashDir()}/${id}.json`;
   if (!exists(p)) writeFile(p, json);
   return { http_ref: `req:${id}` };
+}
+// a typed request too large for a variable is stashed while typing: gone once it's sent or saved
+function dropStash() {
+  const m = /^req:([0-9a-f]{14})$/.exec(env("http_ref", ""));
+  if (m) removeFile(`${stashDir()}/${m[1]}.json`);
 }
 function loadStash(id) {
   if (!STASH_RE.test(id)) return null;
@@ -1699,16 +2141,19 @@ function requestFromEnv(arg) {
 function loadRef(ref) {
   ref = String(ref || "");
   if (ref.startsWith("req:")) return loadStash(ref.slice(4));
-  if (ref.startsWith("resp:")) return RID_RE.test(ref.slice(5)) ? cleanRequest(readJSON(`${respDir(ref.slice(5))}/request.json`, null)) : null;
+  if (ref.startsWith("resp:")) {
+    const rid = ref.slice(5);
+    return RID_RE.test(rid) ? withSecrets(cleanRequest(readJSON(`${respDir(rid)}/request.json`, null)), KC_HISTORY, rid) : null;
+  }
   if (ref.startsWith("hist:")) {
     const e = loadHistory().find((x) => x.id === ref.slice(5));
     if (e && e.req.bodyDropped) return loadRef(`resp:${e.id}`); // while its response folder is cached
-    return e ? e.req : null;
+    return e ? withSecrets(e.req, KC_HISTORY, e.id) : null;
   }
   if (ref.startsWith("saved:")) {
     const name = ref.slice(6).toLowerCase();
     const e = loadSaved().find((x) => x.name.toLowerCase() === name);
-    return e ? e.req : null;
+    return e ? withSecrets(e.req, KC_SAVED, name) : null;
   }
   return null;
 }
@@ -1721,6 +2166,13 @@ function outText(text) {
   return `httpfile:${p}`;
 }
 function resolveText(arg) {
+  arg = String(arg || "");
+  if (arg === "httpvar:") return env("http_text", "");
+  if (arg.startsWith("httpref:curl:")) {
+    // ⌘↩ on a stored request whose secrets are in the Keychain: build the command only now
+    const req = loadRef(arg.slice(13));
+    return req ? toCurl(req) : "";
+  }
   const m = /^httpfile:(.+)$/.exec(arg);
   if (!m) return arg;
   const root = `${cacheDir()}/`;
@@ -1747,12 +2199,14 @@ function prune() {
 function clipboardText() {
   const t = env("HTTP_TEST_CLIPBOARD", null); // test suite only
   if (t !== null) return t;
+  if (testMode()) throw new Error("test mode needs HTTP_TEST_CLIPBOARD"); // never the real clipboard
   const s = $.NSPasteboard.generalPasteboard.stringForType($.NSPasteboardTypeString);
   return s.isNil() ? "" : s.js;
 }
 function setClipboard(text) {
   const out = env("HTTP_TEST_CLIPBOARD_OUT", null); // test suite only
   if (out !== null) return writeFile(out, text);
+  if (testMode()) throw new Error("test mode needs HTTP_TEST_CLIPBOARD_OUT");
   const pb = $.NSPasteboard.generalPasteboard;
   pb.clearContents;
   return pb.setStringForType($(text), $.NSPasteboardTypeString);
@@ -1782,22 +2236,29 @@ function withMods(item, mods = {}) {
 // ⌘C copies text.copy, which has to stay small: a long text is cut, and says so
 const CUT_NOTE = "\n… (cut: press ↩ to copy all of it)";
 function copyText(text) {
-  return text.length <= INLINE_MAX ? text : text.slice(0, INLINE_MAX) + CUT_NOTE;
+  return text.length <= INLINE_MAX ? text : cut(text, INLINE_MAX) + CUT_NOTE;
+}
+// Text for the next object travels in the http_text variable (the environment, which only this user's
+// processes can read), never in arg (a process argument, which every user can see with ps: it may
+// hold a token). A text too long for the environment goes through a cache file (httpfile:<path>).
+function payload(text, action) {
+  if (text.length > INLINE_MAX) return { arg: outText(text), variables: { http_action: action } };
+  return { arg: "httpvar:", variables: { http_action: action, http_text: text } };
 }
 function pasteMod(text, subtitle) {
-  return { arg: outText(text), subtitle, variables: { http_action: "paste" } };
+  return Object.assign(payload(text, "paste"), { subtitle });
 }
 function copyItem(title, subtitle, text, iconName, extra = {}) {
   return withMods(Object.assign({
-    title, subtitle, arg: outText(text), variables: { http_action: "copy" }, icon: icon(iconName),
-    text: { copy: copyText(text), largetype: text.slice(0, 4000) },
-  }, extra), { cmd: pasteMod(text, "⌘↩ Paste into the frontmost app") });
+    title, subtitle, icon: icon(iconName),
+    text: { copy: copyText(text), largetype: cut(text, 4000) },
+  }, payload(text, "copy"), extra), { cmd: pasteMod(text, "⌘↩ Paste into the frontmost app") });
 }
 
 function maskRequest(req) {
   return Object.assign({}, req, {
     url: maskURL(req.url),
-    headers: req.headers.map(([k, v]) => [k, maskHeader(k, v)]),
+    headers: shownHeaders(req).map(([k, v]) => [k, maskHeader(k, v)]),
     auth: req.auth ? maskAuth(req.auth) : null,
     body: req.body ? Object.assign({}, req.body, { text: maskBody(req.body.text), fields: req.body.fields && req.body.fields.map(([k, v]) => [k, SECRET_FIELD.test(k) ? DOTS : v]) }) : null,
   });
@@ -1810,7 +2271,8 @@ function bodySummary(body) {
 }
 function requestSummary(req) {
   const parts = [];
-  if (req.headers.length) parts.push(plural(req.headers.length, "header"));
+  const n = req.headers.length + (req.hidden || []).length;
+  if (n) parts.push(plural(n, "header"));
   if (req.auth) parts.push("basic auth");
   if (req.body) parts.push(bodySummary(req.body));
   return parts.join(" · ");
@@ -1821,7 +2283,7 @@ function requestText(req) {
   if (m.auth) out.push(`Basic auth: ${m.auth}`);
   if (m.body && m.body.kind === "multipart") out.push("", ...m.body.fields.map(([k, v]) => `${k}=${v}`));
   else if (m.body) out.push("", m.body.kind === "json" && !jsonError(m.body.text) ? prettyJSON(m.body.text) : m.body.text);
-  return out.join("\n").slice(0, 4000);
+  return cut(out.join("\n"), 4000);
 }
 const needsConfirm = (req) => CONFIRM && !SAFE_METHODS.has(req.method);
 
@@ -1836,14 +2298,16 @@ function requestRow(req, o) {
   const curl = toCurl(req);
   const item = {
     title: oneLine(title, 200), subtitle: sub, icon: methodIcon(req.method),
-    text: { copy: copyText(curl), largetype: requestText(req) },
+    // a stored request without its secrets: ⌘C shows where they go (masked) rather than leaving them out
+    text: { copy: copyText(req.redacted ? toCurl(maskRequest(req)) : curl), largetype: requestText(req) },
   };
   // the review step is a query: "!" + the typed request, or "!" + a reference (hist:…, saved:…, clip)
   if (confirm) Object.assign(item, { valid: false, autocomplete: `!${o.review || o.ref || o.line}` });
   else Object.assign(item, { arg: "send", variables: Object.assign({ http_action: "send" }, o.ref ? { http_ref: o.ref } : reqVars(req)) });
-  if (req.method === "GET" && !req.body && !req.headers.length && !req.auth) item.quicklookurl = req.url;
-  const mods = { cmd: pasteMod(curl, "⌘↩ Paste as a curl command") };
-  if (req.method === "GET" && !req.body) mods.alt = { arg: req.url, subtitle: "⌥↩ Open in the browser", variables: { http_action: "open" } };
+  if (req.method === "GET" && !req.body && !req.headers.length && !(req.hidden || []).length && !req.auth) item.quicklookurl = req.url;
+  // secrets in the Keychain are read only when ⌘↩ is pressed, not for every row on every keystroke
+  const mods = { cmd: req.vault && o.ref ? { arg: `httpref:curl:${o.ref}`, subtitle: "⌘↩ Paste as a curl command", variables: { http_action: "paste" } } : pasteMod(curl, "⌘↩ Paste as a curl command") };
+  if (req.method === "GET" && !req.body) mods.alt = Object.assign(payload(req.url, "open"), { subtitle: "⌥↩ Open in the browser" });
   if (o.kind === "history") {
     if (exists(`${respDir(o.entry.id)}/meta.json`)) mods.alt = { arg: o.entry.id, subtitle: "⌥↩ Show the last response", variables: { http_action: "show", http_ref: o.ref } };
     mods.ctrl = { arg: o.entry.id, subtitle: "⌃↩ Remove from the history", variables: { http_action: "forget" } };
@@ -1856,11 +2320,14 @@ function requestRow(req, o) {
 function detailRows(req, withConverters = true) {
   const items = [];
   for (const n of req.notes || []) items.push(info(n, "Note", "info"));
-  for (const [k, v] of req.headers) {
-    items.push(copyItem(oneLine(`${k}: ${maskHeader(k, v)}`, 200), `Request header · ↩ Copy the value${isSecretHeader(k) ? " (the real one)" : ""}`, v, "header", { text: { copy: v, largetype: `${k}: ${maskHeader(k, v)}` } }));
-  }
+  const hidden = new Set((req.hidden || []).map(([i]) => i));
+  let h = 0;
+  shownHeaders(req).forEach(([k, v], i) => {
+    if (hidden.has(i)) return items.push(info(`${k}: ${DOTS}`, "Secret header · not kept, so it won’t be sent", "header"));
+    items.push(copyItem(oneLine(`${k}: ${maskHeader(k, v)}`, 200), `Request header · ↩ Copy the value${isSecretHeader(k) ? " (the real one)" : ""}`, v, "header", { uid: `header-${h++}`, text: { copy: v, largetype: `${k}: ${maskHeader(k, v)}` } }));
+  });
   if (req.auth) items.push(info(`Basic auth: ${maskAuth(req.auth)}`, "Sent as an Authorization header", "header"));
-  if (req.redacted) items.push(info("Secret headers weren’t kept", "Turn on “Remember secrets” in the Workflow’s Configuration to keep them in the history", "info"));
+  if (req.redacted) items.push(info("Secrets weren’t kept", "Turn on “Remember secrets” in the Workflow’s Configuration to keep them in the Keychain", "info"));
   if (req.body) {
     const b = req.body;
     const shown = b.kind === "multipart" ? b.fields.map(([k, v]) => `${k}=${SECRET_FIELD.test(k) ? DOTS : v}`).join(" · ") : maskBody(b.text);
@@ -1879,7 +2346,7 @@ function converterRows(req) {
     const code = fn(req);
     if (code === null) continue;
     const shown = fn(masked);
-    items.push(copyItem(`Copy as ${name}`, oneLine(shown, 120), code, "code", { uid: `convert-${id}`, text: { copy: copyText(code), largetype: shown.slice(0, 4000) } }));
+    items.push(copyItem(`Copy as ${name}`, oneLine(shown, 120), code, "code", { uid: `convert-${id}`, text: { copy: copyText(code), largetype: cut(shown, 4000) } }));
   }
   return items;
 }
@@ -2063,14 +2530,23 @@ function responseText(m) {
   if (m.timing) out.push(timingText(m));
   if (m.size !== undefined) out.push(`${fmtBytes(m.size)}${m.truncated ? " (stopped at the size limit)" : ""}`);
   if (m.headers.length) out.push("", ...m.headers.map(([k, v]) => `${k}: ${maskHeader(k, v)}`));
-  if (m.previewText) out.push("", m.previewText.slice(0, 2000));
-  return out.join("\n").slice(0, 4000);
+  if (m.previewText) out.push("", cut(m.previewText, 2000));
+  return cut(out.join("\n"), 4000);
+}
+
+// What ⌘Y shows: HTML and SVG only through their safe preview page, never the body as it came
+function qlFile(m) {
+  if (m.quicklookFile) return m.quicklookFile;
+  if (m.kind === "html" || /\.(svg|html?)$/i.test(m.previewFile || "")) return undefined;
+  return m.previewFile || undefined;
 }
 
 function responseView(rid) {
   const st = respState(rid);
   const hist = loadHistory().find((e) => e.id === rid);
-  const req = cleanRequest(readJSON(`${respDir(rid)}/request.json`, null)) || (hist && hist.req);
+  const stored = cleanRequest(readJSON(`${respDir(rid)}/request.json`, null)) || (hist && hist.req);
+  // the Keychain is read once the response is there (not on every rerun while it's sending)
+  const req = st.state === "done" && stored ? withSecrets(stored, KC_HISTORY, rid) : stored;
   const again = (title) => {
     if (!req) return null;
     return requestRow(req, { ref: hist ? `hist:${rid}` : `resp:${rid}`, title, kind: "again", notes: [] });
@@ -2101,14 +2577,14 @@ function responseView(rid) {
     const title = `${m.status} ${m.reason || statusName(m.status)} · ${m.timing ? fmtMs(m.timing.total) : "–"} · ${fmtBytes(m.size || 0)}${m.truncated ? " (stopped)" : ""}`;
     const sub = [disp, mime, m.error ? m.error.message : "", isText ? "↩ Copy the body" : m.kind === "image" || m.kind === "pdf" ? "↩ Open" : m.bodyFile ? "↩ Show in Finder" : ""].filter(Boolean).join(" · ");
     const item = { title, subtitle: sub, icon: statusIcon(m.status), text: { copy: `${m.status} ${m.reason || statusName(m.status)}`, largetype: responseText(m) } };
-    if (m.previewFile) item.quicklookurl = m.previewFile;
+    if (qlFile(m)) item.quicklookurl = qlFile(m);
     const mods = {};
     if (isText) {
       Object.assign(item, { arg: bodyArg, variables: { http_action: "copy" } });
       mods.cmd = { arg: bodyArg, subtitle: "⌘↩ Paste the body into the frontmost app", variables: { http_action: "paste" } };
     } else if (m.bodyFile) Object.assign(item, { arg: m.bodyFile, variables: { http_action: m.kind === "image" || m.kind === "pdf" ? "openfile" : "reveal" } });
     else item.valid = false;
-    if (m.method === "GET") mods.alt = { arg: m.url, subtitle: "⌥↩ Open in the browser", variables: { http_action: "open" } };
+    if (m.method === "GET") mods.alt = Object.assign(payload(req && req.method === "GET" ? req.url : m.url, "open"), { subtitle: "⌥↩ Open in the browser" });
     items.push(withMods(item, mods));
   }
   if (m.truncated) items.push(info(m.error && m.error.code === 63 && !m.size ? m.error.message : `Stopped at ${fmtBytes(MAX_BYTES)}: the rest wasn’t downloaded`, "Raise the size limit in the Workflow’s Configuration", "info"));
@@ -2121,7 +2597,7 @@ function responseView(rid) {
     if (m.encoding && m.encoding !== "UTF-8") bits.push(`decoded from ${m.encoding}`);
     if (m.truncatedPreview) bits.push("large: previewed as is");
     bits.push(isText ? "↩ Copy · ⌘Y Quick Look · ⌘L Large Type" : "⌘Y Quick Look");
-    const item = { title: oneLine(isText ? maskBody(first) : m.previewText, 200) || "(empty)", subtitle: bits.join(" · "), icon: icon(m.kind === "image" ? "image" : "body"), quicklookurl: m.previewFile, text: { copy: !isText ? m.bodyFile : m.previewText.length < 4000 && !m.truncatedPreview ? m.previewText : m.previewText + CUT_NOTE, largetype: m.previewText.slice(0, 4000) } };
+    const item = { title: oneLine(isText ? maskBody(first) : m.previewText, 200) || "(empty)", subtitle: bits.join(" · "), icon: icon(m.kind === "image" ? "image" : "body"), quicklookurl: qlFile(m), text: { copy: !isText ? m.bodyFile : m.previewText.length < 4000 && !m.truncatedPreview ? m.previewText : m.previewText + CUT_NOTE, largetype: cut(m.previewText, 4000) } };
     if (isText) {
       Object.assign(item, { arg: bodyArg, variables: { http_action: "copy" } });
       items.push(withMods(item, { cmd: { arg: bodyArg, subtitle: "⌘↩ Paste the body", variables: { http_action: "paste" } } }));
@@ -2139,7 +2615,7 @@ function responseView(rid) {
   // 4. headers
   if (m.headers.length) {
     const all = m.headers.map(([k, v]) => `${k}: ${v}`).join("\n");
-    items.push(copyItem(`Headers (${m.headers.length})`, oneLine(m.headers.slice(0, 4).map(([k]) => k).join(", "), 100) + " · ↩ Copy all", all, "header", { text: { copy: all, largetype: m.headers.map(([k, v]) => `${k}: ${maskHeader(k, v)}`).join("\n").slice(0, 4000) } }));
+    items.push(copyItem(`Headers (${m.headers.length})`, oneLine(m.headers.slice(0, 4).map(([k]) => k).join(", "), 100) + " · ↩ Copy all", all, "header", { text: { copy: all, largetype: cut(m.headers.map(([k, v]) => `${k}: ${maskHeader(k, v)}`).join("\n"), 4000) } }));
     for (const [k, v] of m.headers.slice(0, 40)) items.push(copyItem(oneLine(`${k}: ${maskHeader(k, v)}`, 200), "Response header · ↩ Copy the value", v, "header", { text: { copy: v, largetype: `${k}: ${maskHeader(k, v)}` } }));
   }
   // 5. again, save, convert
@@ -2184,8 +2660,9 @@ function filter(query) {
 
 // ---------- actions ----------
 
+// test suite only: never open apps or Alfred, and never touch the real clipboard or Keychain
 function testMode() {
-  return env("HTTP_TEST_NOOPEN", "0") !== "0"; // test suite only: never open apps or Alfred
+  return env("HTTP_TEST_NOOPEN", "0") !== "0" || env("HTTP_SYNC", "0") !== "0";
 }
 function alfredSearch(text) {
   if (testMode()) return;
@@ -2195,8 +2672,9 @@ function alfredSearch(text) {
 function startSend(req) {
   const rid = newRid();
   const dir = mkdirs(respDir(rid), true);
-  writeFile(`${dir}/request.json`, JSON.stringify(req));
-  addHistory(rid, req);
+  // the sender reads the full request from send.json and deletes it; request.json never holds secrets
+  writeFile(`${dir}/send.json`, JSON.stringify(req));
+  writeFile(`${dir}/request.json`, JSON.stringify(addHistory(rid, req)));
   prune();
   if (env("HTTP_SYNC", "0") === "1") {
     sendNow(rid, false); // test suite: send in this process
@@ -2204,6 +2682,7 @@ function startSend(req) {
   }
   const script = `${FM.currentDirectoryPath.js}/http.js`;
   if (!exists(script) || !spawn("/usr/bin/osascript", ["-l", "JavaScript", script, "send", rid])) {
+    removeFile(`${dir}/send.json`);
     writeFile(`${dir}/meta.json`, JSON.stringify({ rid, t: now(), method: req.method, url: req.url, status: 0, headers: [], error: { code: -1, message: "Couldn’t start sending the request" } }));
   }
   return rid;
@@ -2220,6 +2699,7 @@ function cancel(rid) {
     const cmd = exec("/bin/ps", ["-o", "command=", "-p", String(pid)]).stdout;
     if ((f === "pid" && cmd.includes("http.js") && cmd.includes(rid)) || (f === "curlpid" && /\/usr\/bin\/curl\b/.test(cmd))) $.kill(pid, 15);
   }
+  removeFile(`${dir}/send.json`);
   const req = cleanRequest(readJSON(`${dir}/request.json`, null)) || { method: "", url: "" };
   const meta = { rid, t: now(), method: req.method, url: req.url, status: 0, headers: [], error: { code: -3, message: "Cancelled" } };
   writeFile(`${dir}/meta.json`, JSON.stringify(meta));
@@ -2241,6 +2721,7 @@ function act(arg) {
       const req = requestFromEnv(arg);
       if (!req) return "Couldn’t send the request: it’s no longer available";
       const rid = startSend(req);
+      dropStash();
       alfredSearch(`${keyword()} =${rid}`);
       return report ? `sent ${rid}` : "";
     }
@@ -2253,11 +2734,12 @@ function act(arg) {
       setClipboard(resolveText(arg));
       return "";
     case "open": {
-      if (!/^https?:\/\/[^\s]+$/i.test(arg)) return "";
-      const url = $.NSURL.URLWithString(arg);
+      const u = resolveText(arg);
+      if (!/^https?:\/\/[^\s]+$/i.test(u)) return "";
+      const url = $.NSURL.URLWithString(u);
       if (url.isNil()) return "";
       if (!testMode()) $.NSWorkspace.sharedWorkspace.openURL(url);
-      return report ? `open ${arg}` : "";
+      return report ? `open ${u}` : "";
     }
     case "openfile":
     case "reveal": {
@@ -2277,7 +2759,10 @@ function act(arg) {
       if (!validName(name)) return "Couldn’t save the request: names can be 1–60 characters";
       const req = requestFromEnv("");
       if (!req) return "Couldn’t save the request: it’s no longer available";
-      return saveNamed(name, req) ? `Saved “${name}”` : `Couldn’t save the request: there are already ${SAVED_MAX} saved requests`;
+      const done = saveNamed(name, req);
+      dropStash();
+      if (done === "partial") return `Saved “${name}” without its secrets: the Keychain didn’t accept them`;
+      return done ? `Saved “${name}”` : `Couldn’t save the request: there are already ${SAVED_MAX} saved requests`;
     }
     case "unsave": {
       const name = env("http_name", arg);
@@ -2286,10 +2771,12 @@ function act(arg) {
     case "forget": {
       if (!RID_RE.test(arg)) return "";
       withLock(historyLock(), () => saveHistory(loadHistory().filter((e) => e.id !== arg)));
+      vaultDelete(KC_HISTORY, arg);
       return "Removed from the history";
     }
     case "clear":
       withLock(historyLock(), () => saveHistory([]));
+      vaultClear(KC_HISTORY);
       return "Cleared the request history";
     case "clearcache":
       for (const d of ["resp", "req", "out"]) removeFile(`${cacheDir()}/${d}`);
@@ -2328,6 +2815,11 @@ function run(argv) {
       case "send":
         sendNow(rest[0] || "", true);
         return undefined;
+      case "resolve": { // resolve.sh: httpref:… → the text, exactly (no trailing newline)
+        const t = resolveText(rest.join(" "));
+        $.NSFileHandle.fileHandleWithStandardOutput.writeData($(t).dataUsingEncoding($.NSUTF8StringEncoding));
+        return undefined;
+      }
       case "tokenize": // test suite: [command…] → [{words, notes} | {error}]
       case "parse": // test suite: [line…] → [request | {error}]
       case "convert": {
@@ -2346,6 +2838,8 @@ function run(argv) {
       }
       case "pretty":
         return prettyJSON(readStdin());
+      case "quicklook": // test suite: HTML on stdin → the safe preview page
+        return safeHTML(readStdin());
     }
     return undefined;
   } catch (e) {

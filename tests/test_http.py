@@ -134,6 +134,19 @@ class Mock(BaseHTTPRequestHandler):
             return self.send(200, b"{}", "application/json", [("Set-Cookie", "session=abc123secret; Path=/; HttpOnly")])
         if p == "/html":
             return self.send(200, b"<!doctype html><title>Hi</title><h1>Hello</h1>", "text/html; charset=utf-8")
+        if p == "/evil-html":
+            t = BASE + "/track"
+            page = (f'<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "{t}/dtd"><html><head>'
+                    f'<link rel="stylesheet" href="{t}/css"><base href="{t}/"><meta http-equiv="refresh" content="0;url={t}/r">'
+                    f'<style>@import url({t}/import);</style><script src="{t}/js"></script></head>'
+                    f'<body background="{t}/bg" style="background:url({t}/inline)"><h1 onclick="x()">Hello &amp; <i>world</i></h1>'
+                    f'<img src="{t}/img" alt="logo"><img srcset="{t}/srcset 2x"><svg><image href="{t}/svg"/></svg>'
+                    f'<iframe src="{t}/frame"></iframe><object data="{t}/obj"></object><video poster="{t}/poster"></video>'
+                    f'<a href="{t}/link">link</a><table><tr><td colspan="2">cell</td></tr></table></body></html>')
+            return self.send(200, page.encode(), "text/html; charset=utf-8")
+        if p == "/svg":
+            svg = f'<svg xmlns="http://www.w3.org/2000/svg"><image href="{BASE}/track/svg"/><script>1</script></svg>'
+            return self.send(200, svg.encode(), "image/svg+xml")
         if p == "/empty":
             return self.send(200, b"", "text/plain")
         if p == "/proto":
@@ -202,12 +215,14 @@ class Env:
         self.cache = os.path.join(self.dir, "Caches", "com.runningwithcrayons.Alfred", "Workflow Data", "io.github.x-o-r-r-o.http")
         self.data = os.path.join(self.dir, "Application Support", "Alfred", "Workflow Data", "io.github.x-o-r-r-o.http")
         self.clip_out = os.path.join(self.dir, "clipboard-out.txt")
+        self.keychain = os.path.join(self.dir, "Keychain stand-in")
 
     def vars(self, **extra):
         e = {k: v for k, v in os.environ.items() if not k.startswith(("http_", "HTTP_"))}
         e.update(alfred_workflow_cache=self.cache, alfred_workflow_data=self.data,
                  alfred_workflow_bundleid="io.github.x-o-r-r-o.http", alfred_workflow_version="1.0.0",
                  HTTP_TEST_CLIPBOARD="", HTTP_TEST_CLIPBOARD_OUT=self.clip_out, HTTP_TEST_NOOPEN="1",
+                 HTTP_TEST_KEYCHAIN=self.keychain,
                  HTTP_SYNC="1", timeout="5")
         e.update({k: str(v) for k, v in extra.items()})
         return e
@@ -254,6 +269,22 @@ class Env:
     def history(self):
         p = os.path.join(self.data, "history.json")
         return json.loads(readf(p))["items"] if os.path.exists(p) else []
+
+
+def keychain_dump(env):
+    """Everything in the test stand-in for the Keychain."""
+    if not os.path.isdir(env.keychain):
+        return ""
+    return "".join(readf(os.path.join(env.keychain, f)) for f in sorted(os.listdir(env.keychain)))
+
+
+def all_args(items):
+    """Every arg Alfred would pass to the next object (a process argument, visible in ps)."""
+    out = []
+    for i in items:
+        out.append(i.get("arg", ""))
+        out.extend(m.get("arg", "") for m in (i.get("mods") or {}).values())
+    return json.dumps(out, ensure_ascii=False)
 
 
 def js(cmd, inputs):
@@ -600,7 +631,8 @@ class FilterTests(Base):
         self.assertEqual(row["arg"], "send")
         self.assertEqual(row["variables"]["http_action"], "send")
         self.assertEqual(json.loads(row["variables"]["http_req"])["url"], "https://api.github.com/users/octocat")
-        self.assertEqual(row["mods"]["cmd"]["arg"], "curl https://api.github.com/users/octocat")
+        self.assertEqual(row["mods"]["cmd"]["arg"], "httpvar:")
+        self.assertEqual(row["mods"]["cmd"]["variables"]["http_text"], "curl https://api.github.com/users/octocat")
         for name in ("curl", "JavaScript fetch", "Python requests", "HTTPie", "wget"):
             find(items, f"Copy as {name}")
 
@@ -613,8 +645,10 @@ class FilterTests(Base):
         self.assertIn("sid=•••", shown)
         self.assertIn("api_key=•••", items[0]["title"])
         curl = find(items, "Copy as curl")
-        self.assertIn("SECRETTOKEN", curl["arg"])
-        self.assertIn("SECRETTOKEN", items[0]["mods"]["cmd"]["arg"])
+        self.assertIn("SECRETTOKEN", curl["variables"]["http_text"])
+        self.assertIn("SECRETTOKEN", items[0]["mods"]["cmd"]["variables"]["http_text"])
+        self.assertEqual(self.env.act(curl), "")
+        self.assertIn("SECRETTOKEN", self.env.clipboard())
 
     def test_non_get_needs_confirmation(self):
         items = self.env.items('post httpbin.org/post {"a":1}')
@@ -847,19 +881,32 @@ class SendTests(Base):
         rid, items = self.env.send(f"get {BASE}/cookies")
         row = find(items, "Set-Cookie:")
         self.assertEqual(row["title"], "Set-Cookie: session=•••; Path=/; HttpOnly")
-        self.assertEqual(row["arg"], "session=abc123secret; Path=/; HttpOnly")
+        self.assertEqual(row["variables"]["http_text"], "session=abc123secret; Path=/; HttpOnly")
+        self.assertEqual(self.env.act(row), "")
+        self.assertEqual(self.env.clipboard(), "session=abc123secret; Path=/; HttpOnly")
         self.assertNotIn("abc123secret", items[0]["text"]["largetype"])
 
     def test_history_and_secrets(self):
-        rid, items = self.env.send(f"get {BASE}/anything H:Authorization=Bearer SECRET1 -u me:SECRET2")
-        home = self.env.items("")
+        rid, items = self.env.send(f"get {BASE}/anything H:Authorization=Bearer SECRET1 -u me:SECRET2", keep_secrets="1")
+        home = self.env.items("", keep_secrets="1")
         self.assertTrue(home[0]["title"].startswith("GET http://127.0.0.1"))
         self.assertIn("200 OK", home[0]["subtitle"])
         self.assertNotIn("SECRET", json.dumps([(i["title"], i["subtitle"], i["text"]["largetype"]) for i in home]))
-        self.assertIn("SECRET1", json.dumps(self.env.history()))
+        # the history file has no secrets; the Keychain has them
+        self.assertNotIn("SECRET", json.dumps(self.env.history()))
+        self.assertIn("SECRET1", keychain_dump(self.env))
+        self.assertNotIn("SECRET", home[0]["text"]["copy"])
+        self.assertIn("Authorization: •••", home[0]["text"]["copy"])
+        # ⌘↩ builds the real command only when pressed
+        self.assertTrue(home[0]["mods"]["cmd"]["arg"].startswith("httpref:curl:hist:"))
+        out = subprocess.run(["/bin/bash", "-c", RESOLVE_SCRIPT, "bash", home[0]["mods"]["cmd"]["arg"]], cwd=SRC,
+                             env=self.env.vars(), capture_output=True, text=True)
+        self.assertIn("Authorization: Bearer SECRET1", out.stdout)
+        self.assertIn("me:SECRET2", out.stdout)
+        self.assertFalse(out.stdout.endswith("\n"))
         # send again from the history
         Mock.requests = []
-        out = self.env.act(home[0])
+        out = self.env.act(home[0], keep_secrets="1")
         self.assertTrue(out.startswith("sent "))
         self.assertEqual(Mock.requests[-1]["headers"]["Authorization"], "Bearer SECRET1")
         self.assertEqual(len(self.env.history()), 1)  # the same request moves to the top
@@ -868,15 +915,21 @@ class SendTests(Base):
         self.assertEqual(self.env.act(home[0]["mods"]["alt"]), f"show {home[0]['mods']['alt']['arg']}")
         self.assertEqual(self.env.act(home[0]["mods"]["ctrl"]), "Removed from the history")
         self.assertEqual(self.env.history(), [])
-        # without "Remember secrets", history drops them
-        self.env.send(f"get {BASE}/anything H:Authorization=Bearer SECRET3 -u me:SECRET4", keep_secrets="0")
+        self.assertEqual(keychain_dump(self.env), "")  # its secrets went with it
+        # without "Remember secrets" (the default), history drops them
+        self.env.send(f"get {BASE}/anything H:Authorization=Bearer SECRET3 -u me:SECRET4")
         dump = json.dumps(self.env.history())
         self.assertNotIn("SECRET3", dump)
         self.assertNotIn("SECRET4", dump)
         for d in os.listdir(os.path.join(self.env.cache, "resp")):
             self.assertNotIn("SECRET3", readf(os.path.join(self.env.cache, "resp", d, "request.json")))
+        self.assertEqual(keychain_dump(self.env), "")
         home = self.env.items("")
         self.assertIn("secrets weren’t kept", find(home, "GET http://127.0.0.1")["subtitle"])
+        Mock.requests = []
+        self.env.act(find(home, "GET http://127.0.0.1"))
+        # sent without them, as the row says: the user name stays, with an empty password
+        self.assertEqual(Mock.requests[-1]["headers"]["Authorization"], "Basic " + base64.b64encode(b"me:").decode())
 
     def test_history_filter_and_saved(self):
         self.env.send(f"get {BASE}/anything/alpha")
@@ -1154,6 +1207,199 @@ class PlistTests(unittest.TestCase):
         names |= set(re.findall(r'"(s[2-5]xx|get|post|put|patch|delete|method)"', src))
         for n in names:
             self.assertTrue(os.path.exists(os.path.join(SRC, "icons", n + ".png")), n)
+
+
+# ---------------------------------------------------------------------------------------------
+class Audit4RegressionTests(Base):
+    """Independent audit: secrets at rest, secrets in process arguments, Quick Look, curl options."""
+
+    SECRET_REQ = "get {base}/status/200?api_key=SECRETKEY H:Authorization=Bearer SECRETTOKEN Cookie:sid=SECRETSID -u me:SECRETPW"
+
+    def tree(self):
+        for root in (self.env.cache, self.env.data):
+            for d, dirs, files in os.walk(root):
+                yield d, True
+                for f in files:
+                    yield os.path.join(d, f), False
+
+    def test_files_are_private_and_hold_no_secrets(self):
+        for keep in ("0", "1"):
+            self.env.send(self.SECRET_REQ.format(base=BASE), keep_secrets=keep)
+        self.env.act(self.env.items(f"save Mine post {BASE}/status/200 password=SECRETBODY H:X-Api-Key=SECRETAPI")[0])
+        seen = 0
+        for path, is_dir in self.tree():
+            mode = os.stat(path).st_mode & 0o777
+            self.assertEqual(mode, 0o700 if is_dir else 0o600, path)
+            if not is_dir:
+                seen += 1
+                self.assertNotIn("SECRET", readf(path, "rb").decode("utf-8", "replace"), path)
+                self.assertNotIn(os.path.basename(path), ("send.json", "stderr.txt", "headers.txt"))
+        self.assertGreater(seen, 5)
+        kc = keychain_dump(self.env)
+        for secret in ("SECRETTOKEN", "SECRETSID", "SECRETPW", "SECRETKEY", "SECRETBODY", "SECRETAPI"):
+            self.assertIn(secret, kc)
+
+    def test_saved_requests_send_their_secrets(self):
+        out = self.env.act(self.env.items(f"save Login post {BASE}/anything?token=SECRETQ password=SECRETP H:Authorization=Bearer SECRETH")[0])
+        self.assertEqual(out, "Saved “Login”")
+        saved = readf(os.path.join(self.env.data, "saved.json"))
+        self.assertNotIn("SECRET", saved)
+        row = find(self.env.items(""), "Login · POST")
+        self.assertNotIn("SECRET", json.dumps(row, ensure_ascii=False))
+        confirm = self.env.items(row["autocomplete"])
+        self.assertIn("SECRETH", find(confirm, "Copy as curl")["variables"]["http_text"])
+        self.assertNotIn("SECRET", all_args(confirm))
+        Mock.requests = []
+        self.assertTrue(self.env.act(confirm[0]).startswith("sent "))
+        r = Mock.requests[-1]
+        self.assertEqual(r["headers"]["Authorization"], "Bearer SECRETH")
+        self.assertIn("token=SECRETQ", r["path"])
+        self.assertEqual(json.loads(r["body"]), {"password": "SECRETP"})
+        self.assertEqual(self.env.act(find(self.env.items(""), "Login · POST")["mods"]["ctrl"]), "Deleted “Login”")
+        self.assertEqual(keychain_dump(self.env), "")
+
+    def test_no_secret_in_any_process_argument(self):
+        q = self.SECRET_REQ.format(base=BASE)
+        self.assertNotIn("SECRET", all_args(self.env.items(q)))
+        self.assertNotIn("SECRET", all_args(self.env.items("!post " + q[4:])))
+        rid, items = self.env.send(q.replace("/status/200", "/cookies"), keep_secrets="1")
+        self.assertNotIn("SECRET", all_args(items))
+        self.assertIn("SECRETTOKEN", find(items, "Copy as curl")["variables"]["http_text"])  # still copied for real
+        self.assertNotIn("SECRET", all_args(self.env.items("", keep_secrets="1")))
+        self.assertNotIn("abc123secret", all_args(items))  # a response's Set-Cookie too
+
+    def test_history_dedupe_ignores_secrets(self):
+        self.env.send(f"get {BASE}/anything H:Authorization=Bearer ONE", keep_secrets="1")
+        self.env.send(f"get {BASE}/anything H:Authorization=Bearer TWO", keep_secrets="1")
+        h = self.env.history()
+        self.assertEqual(len(h), 1)  # the same request with a new token replaces the old one
+        kc = keychain_dump(self.env)
+        self.assertIn("TWO", kc)
+        self.assertNotIn("ONE", kc)
+        self.assertEqual(self.env.act(find(self.env.items("clear"), "Clear the request history")), "Cleared the request history")
+        self.assertEqual(keychain_dump(self.env), "")
+
+    def test_test_mode_never_falls_back_to_real_services(self):
+        v = self.env.vars()
+        for name in ("HTTP_TEST_CLIPBOARD", "HTTP_TEST_KEYCHAIN"):
+            e = dict(v, keep_secrets="1")
+            del e[name]
+            out = subprocess.run(["/bin/bash", "-c", SF_SCRIPT, "bash", ""], cwd=SRC, env=e, capture_output=True, text=True)
+            if name == "HTTP_TEST_CLIPBOARD":
+                self.assertIn(name, out.stdout)
+        e = dict(v, keep_secrets="1", http_action="send", http_req=json.dumps(parse([f"get {BASE}/x H:Authorization=Bearer X"])[0]))
+        del e["HTTP_TEST_KEYCHAIN"]
+        out = subprocess.run(["/bin/bash", "-c", ACT_SCRIPT, "bash", "send"], cwd=SRC, env=e, capture_output=True, text=True)
+        self.assertIn("HTTP_TEST_KEYCHAIN", out.stdout)
+        e = dict(v, http_action="copy", http_text="x")
+        del e["HTTP_TEST_CLIPBOARD_OUT"]
+        out = subprocess.run(["/bin/bash", "-c", ACT_SCRIPT, "bash", "httpvar:"], cwd=SRC, env=e, capture_output=True, text=True)
+        self.assertIn("HTTP_TEST_CLIPBOARD_OUT", out.stdout)
+
+    def test_quick_look_never_loads_remote_content(self):
+        rid, items = self.env.send(f"get {BASE}/evil-html")
+        ql = items[0]["quicklookurl"]
+        self.assertTrue(ql.endswith("/quicklook.html"), ql)
+        page = readf(ql)
+        self.assertNotIn("/track", page)
+        for bad in ("<script", "<link", "<iframe", "<object", "<base", "http-equiv", "onclick", "background=", "<svg", "srcset"):
+            self.assertNotIn(bad, page.lower())
+        self.assertIn("<h1>Hello &amp; <i>world</i>", page)
+        self.assertIn('<td colspan="2">', page)
+        self.assertEqual(find(items, "<!DOCTYPE")["quicklookurl"], ql)
+        # ↩ still copies the page as it came
+        self.env.act(items[0])
+        self.assertIn(f"{BASE}/track/img", self.env.clipboard())
+        rid, items = self.env.send(f"get {BASE}/svg")
+        ql = items[0]["quicklookurl"]
+        self.assertTrue(ql.endswith("/quicklook.html"), ql)
+        self.assertIn('<img src="data:image/svg+xml;base64,', readf(ql))
+        self.assertNotIn("/track", readf(ql))
+        self.assertFalse(any(r["path"].startswith("/track") for r in Mock.requests))
+
+    def test_every_curl_option_with_a_value_is_known(self):
+        help_text = subprocess.run(["/usr/bin/curl", "--help", "all"], capture_output=True, text=True).stdout
+        opts = re.findall(r"^\s*(?:-(\S), )?--([a-z0-9.-]+) <[^>]+>", help_text, re.M)
+        extra = ["httpsig-algo", "httpsig-headers", "httpsig-key", "httpsig-keyid", "keepalive-cnt", "parallel-max-host", "ssl-sessions"]
+        names = [o for _, o in opts if o not in ("help", "config", "variable", "upload-file", "netrc-file", "unix-socket",
+                                                  "abstract-unix-socket", "url")] + extra
+        self.assertGreater(len(names), 100)
+        r = parse([f"curl --{o} value.example https://e.com/" for o in names])
+        for o, x in zip(names, r):
+            if "error" in x:
+                self.assertRegex(x["error"], "local file|needs|name=value|isn’t supported", o)
+            else:
+                self.assertTrue(x["url"].startswith("https://e.com/"), (o, x["url"]))  # --url-query adds to it
+        shorts = [sh for sh, o in opts if sh and o in names]
+        r = parse([f"curl -{sh} value.example https://e.com/" for sh in shorts])
+        for sh, x in zip(shorts, r):
+            self.assertTrue("error" in x or x["url"] == "https://e.com/", (sh, x))
+
+    def test_curl_file_and_auth_options_say_they_were_ignored(self):
+        r = parse([
+            "curl -o out.json https://e.com",
+            "curl --output-dir /tmp -O https://e.com/f",
+            "curl -D - -c jar.txt --trace t.txt --libcurl code.c --stderr e.txt --etag-save e https://e.com",
+            "curl --digest -u a:b https://e.com",
+            "curl --netrc https://e.com",
+            "curl --aws-sigv4 aws:amz:us-east-1:s3 -u k:s https://e.com",
+            "curl --frobnicate value.example https://e.com",
+            "curl --frobnicate https://e.com",
+            "curl -W value.example https://e.com",
+        ])
+        for x in r[:3]:
+            self.assertTrue(any("files the command reads or writes" in n for n in x["notes"]), x)
+            self.assertEqual(x["method"], "GET")
+        self.assertTrue(any("--digest isn’t supported" in n for n in r[3]["notes"]))
+        self.assertTrue(any("~/.netrc" in n for n in r[4]["notes"]))
+        self.assertTrue(any("isn’t signed" in n for n in r[5]["notes"]))
+        for x in r[6:]:
+            self.assertIn("its value or the URL", x["error"])
+
+    def test_httpie_nested_json_bearer_and_empty_headers(self):
+        r = parse([
+            "post e.com search[type]=id search[id]:=1 tags[]=a tags[]=b",
+            "post e.com items[2]=x",
+            "post e.com [0][name]=x [1][name]=y",
+            "post e.com a:=[1] a[]=2",
+            "post e.com foo\\[bar\\]:=1",
+            "post e.com n[big]:=12345678901234567890 n[f]:=1.0",
+            "post e.com a[]=1 a[k]=2",
+            "post e.com a[b=1",
+            "e.com -A bearer -a tok123",
+            "e.com --auth-type=bearer --auth=tok",
+            "e.com -A digest -a u:p",
+            "e.com X-Empty; Accept:x",
+            "e.com -A bearer -a t H:Authorization=x",
+        ])
+        self.assertEqual(json.loads(r[0]["body"]["text"]), {"search": {"type": "id", "id": 1}, "tags": ["a", "b"]})
+        self.assertEqual(json.loads(r[1]["body"]["text"]), {"items": [None, None, "x"]})
+        self.assertEqual(json.loads(r[2]["body"]["text"]), [{"name": "x"}, {"name": "y"}])
+        self.assertEqual(json.loads(r[3]["body"]["text"]), {"a": [1, "2"]})
+        self.assertEqual(json.loads(r[4]["body"]["text"]), {"foo[bar]": 1})
+        self.assertEqual(r[5]["body"]["text"], '{"n": {"big": 12345678901234567890, "f": 1.0}}')
+        self.assertIn("can’t use [k] on an array", r[6]["error"])
+        self.assertIn("“]” is missing", r[7]["error"])
+        self.assertEqual(r[8]["headers"], [["Authorization", "Bearer tok123"]])
+        self.assertEqual(r[9]["headers"], [["Authorization", "Bearer tok"]])
+        self.assertIn("isn’t supported", r[10]["error"])
+        self.assertEqual(r[11]["headers"], [["X-Empty", ""], ["Accept", "x"]])
+        self.assertIn("not both", r[12]["error"])
+
+    def test_system_proxy(self):
+        proxy = f"127.0.0.1:{SERVER.server_port}"  # the mock server answers proxy requests too
+        rid, items = self.env.send("get http://proxied.invalid/anything?x=1", HTTP_TEST_PROXY=proxy)
+        self.assertTrue(items[0]["title"].startswith("200 OK"), items[0])
+        self.assertEqual(Mock.requests[-1]["path"], "http://proxied.invalid/anything?x=1")
+        # local addresses never go through it
+        rid, items = self.env.send(f"get {BASE}/anything", HTTP_TEST_PROXY=f"127.0.0.1:{free_port()}")
+        self.assertTrue(items[0]["title"].startswith("200 OK"), items[0])
+
+    def test_truncation_never_splits_an_emoji(self):
+        items = self.env.items("get example.com X-Emoji:" + "😀" * 300)
+        for i in items:
+            for k in ("title", "subtitle"):
+                self.assertNotIn("�", i.get(k, ""), i[k])
 
 
 if __name__ == "__main__":

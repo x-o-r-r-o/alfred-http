@@ -73,9 +73,9 @@
       "type": "checkbox",
       "variable": "keep_secrets",
       "label": "History",
-      "description": "Keeps Authorization, cookie and API key headers so requests can be sent again. They are always masked on screen.",
+      "description": "Keeps the Authorization, cookie, API key and password values of recent requests in the macOS Keychain so they can be sent again. Off: the history is kept without them. Saved requests always keep theirs in the Keychain.",
       "config": {
-        "default": true,
+        "default": false,
         "required": false,
         "text": "Remember secrets"
       }
