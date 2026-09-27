@@ -809,7 +809,7 @@ class SendTests(Base):
         m = self.env.meta(rid)
         self.assertEqual(m["encoding"], "ISO-8859-1")
         self.assertIn("café naïve", readf(m["previewFile"]))
-        self.assertIn("decoded from ISO-8859-1", find(items, "<meta")["subtitle"] if False else json.dumps(items, ensure_ascii=False))
+        self.assertIn("decoded from ISO-8859-1", " ".join(i["subtitle"] for i in items))
         rid, items = self.env.send(f"get {BASE}/latin1-nocharset")
         m = self.env.meta(rid)
         self.assertEqual(m["encoding"], "Windows-1252")
@@ -1080,6 +1080,38 @@ class Audit2RegressionTests(Base):
     def test_cancel_stops_the_sender_first(self):
         src = readf(os.path.join(SRC, "http.js"))
         self.assertIn('for (const f of ["pid", "curlpid"])', src)
+
+
+class Audit3RegressionTests(Base):
+    def test_long_copy_text_says_it_was_cut(self):
+        body = "y" * 60000
+        items = self.env.items("post example.com -d " + body)
+        conv = find(items, "Copy as curl")
+        self.assertTrue(conv["text"]["copy"].endswith("press ↩ to copy all of it)"))
+        self.assertTrue(items[0]["text"]["copy"].endswith("press ↩ to copy all of it)"))
+        rid, items = self.env.send(f"get {BASE}/bytes/9000")
+        body_row = find(items, "aaaa")
+        self.assertTrue(body_row["text"]["copy"].endswith("press ↩ to copy all of it)"))
+        self.assertEqual(self.env.act(body_row), "")
+        self.assertEqual(self.env.clipboard(), "a" * 9000)
+        rid, items = self.env.send(f"get {BASE}/bytes/100")
+        self.assertEqual(find(items, "aaaa")["text"]["copy"], "a" * 100)
+
+
+class HistorySizeTests(Base):
+    def test_huge_bodies_stay_out_of_history(self):
+        big = "z" * 300000
+        rid, items = self.env.send(f"post {BASE}/anything -d {big}")
+        self.assertEqual(len(Mock.requests[-1]["body"]), 300000)
+        h = self.env.history()[0]
+        self.assertTrue(h["req"]["bodyDropped"])
+        self.assertIsNone(h["req"]["body"])
+        self.assertLess(os.path.getsize(os.path.join(self.env.data, "history.json")), 10000)
+        row = find(self.env.items(""), "POST")
+        self.assertIn("too large to keep", row["subtitle"])
+        confirm = self.env.items(row["autocomplete"])
+        self.assertTrue(self.env.act(confirm[0]).startswith("sent "))
+        self.assertEqual(len(Mock.requests[-1]["body"]), 300000)  # sent again from the response folder
 
 
 class PrototypeTests(Base):

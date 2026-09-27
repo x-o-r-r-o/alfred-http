@@ -45,7 +45,9 @@ This workflow: pastes curl commands from the clipboard first thing, one-line HTT
 - File uploads (`-F f=@file`, `-d @file`, `-T`) are refused on purpose: a pasted command must never send a local file.
 - Proxies, client certificates, `--resolve` and `--connect-to` from pasted commands are ignored (noted in the subtitle). System proxy environment variables are honoured by curl only if Alfred's environment has them.
 - Brotli and zstd responses can't be decoded by macOS's curl, so browser commands ask for gzip instead.
-- A typed request is stashed in the cache (to find it on ↩ and in the review step) even when "Remember secrets" is off; stashes are deleted after a day.
+- Typed requests travel to the action in an Alfred variable, so nothing is written while typing; only a request larger than 64 KB is stashed in the cache (deleted after a day).
+- A request body larger than 256 KB isn’t kept in the history (history.json is read on every keystroke); it can be sent again while its response folder is cached (the newest 40).
+- ⌘C on a row whose text is over 50 KB (or a body over 4,000 characters) copies the start and says so; ↩ copies everything.
 - Timing is cumulative across redirects (curl's own numbers).
 - Custom methods sent with `-X` keep their case (curl semantics); known methods are upper-cased.
 - `$'…'` bytes that aren't valid UTF-8 are kept as Latin-1 characters.
@@ -70,6 +72,12 @@ This workflow: pastes curl commands from the clipboard first thing, one-line HTT
 - [x] Keyword ≥ 3 characters and configurable
 - [x] Main icon ≥ 256 px
 - [x] No self-updater; installs nothing; network only to the URLs the user sends
+
+## Audits (3 full passes, 2026-09-28)
+- **Pass 1:** `-u user` without a password made curl prompt on a terminal it doesn't have → sends an empty password with a note; converter quoting left `^`, and `=`/`~` at a word start, unquoted (special in zsh); several `--json` parts were joined with `&` (curl concatenates them); a server's `Content-Type: constructor` and a method named `constructor` hit `Object.prototype` (Maps now); directories were re-created on every row (memoised); old stashes were only pruned on send (the home view now prunes hourly). Regression tests: `Audit1RegressionTests`, `PrototypeTests`.
+- **Pass 2:** every keystroke that parsed wrote the request (with its secrets) to the cache → typed requests now travel in an item variable and the review step is the query `!<request>` / `!hist:<id>` / `!clip`, re-parsed so what is shown is what is sent; cancel killed curl before the sender, which could then overwrite "Cancelled"; `autocomplete` lost tabs through the display sanitiser; the Script Filter's running subtitle said "Sending…" while typing; history rows didn't say when secrets weren't kept; IPv6 hosts covered. Regression tests: `Audit2RegressionTests`.
+- **Pass 3:** ⌘C silently copied only the first 50 KB (or 4,000 characters of a body) → cut texts now say so; huge bodies made history.json (read per keystroke) grow without bound → bodies over 256 KB stay in the response folder only. Regression tests: `Audit3RegressionTests`, `HistorySizeTests`.
+- Checked every pass: bare PATH (absolute /usr/bin/curl, /usr/bin/osascript, /bin/ps), no LANG (explicit UTF-8), cache/data paths with spaces, fresh install, damaged history/saved files, config values empty/padded/"0"/"false"/garbage, macOS 13 JavaScriptCore features (no replaceAll/at/hasOwn/lookbehind), curl ≥ 7.84 write-out variables, injection (argv only, curl config quoting, header names validated, no `@` file syntax reachable), keystroke time 70–110 ms including osascript start (100 history + 20 saved entries).
 
 ## Ideas for v1.1
 - Environments and variables (`{{base}}`, `{{token}}` from the Keychain) for saved requests.

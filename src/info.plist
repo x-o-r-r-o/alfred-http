@@ -267,14 +267,14 @@ Type a request via the `http` keyword: a URL, optionally after a method, like `h
 
 * &lt;kbd&gt;↩&lt;/kbd&gt; Send the request. POST, PUT, PATCH and DELETE show what will be sent first; press &lt;kbd&gt;↩&lt;/kbd&gt; again to send.
 * &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Paste the request as a curl command.
-* &lt;kbd&gt;⌥&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Open the URL in the browser.
+* &lt;kbd&gt;⌥&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Open a GET request’s URL in the browser.
 * &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;L&lt;/kbd&gt; Show the request in Large Type, with secrets masked.
 
 The rows below show the headers and body, and copy the request as curl, JavaScript fetch, Python requests, HTTPie or wget.
 
 The response opens in Alfred when it arrives: status, timing (DNS, connect, TLS, time to first byte and total), size, headers and a preview of the body. JSON is pretty-printed, and text in other encodings is decoded.
 
-* &lt;kbd&gt;↩&lt;/kbd&gt; Copy the body, or open an image or PDF.
+* &lt;kbd&gt;↩&lt;/kbd&gt; Copy the body, open an image or PDF, or show other files in Finder.
 * &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;↩&lt;/kbd&gt; Paste the body into the frontmost app.
 * &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;Y&lt;/kbd&gt; Quick Look the body: JSON, HTML, images and PDFs.
 * &lt;kbd&gt;⌘&lt;/kbd&gt;&lt;kbd&gt;L&lt;/kbd&gt; Show the status, headers and body in Large Type.

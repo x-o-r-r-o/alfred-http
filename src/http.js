@@ -420,6 +420,7 @@ function cleanRequest(r) {
     insecure: r.insecure === true,
     notes: Array.isArray(r.notes) ? r.notes.filter((n) => typeof n === "string").slice(0, 5) : [],
     redacted: r.redacted === true,
+    bodyDropped: r.bodyDropped === true,
   };
 }
 function validHeader(name, value) {
@@ -1615,11 +1616,15 @@ function saveHistory(items) {
   return writeFile(historyPath(), JSON.stringify({ version: 1, items: items.slice(0, HISTORY_MAX) }));
 }
 const historyLock = () => `${cacheDir()}/history.lock`;
+// history.json is read on every keystroke of the home view: a huge body stays in the response folder only
+const HISTORY_REQ_MAX = 256 * 1024;
 function addHistory(rid, req) {
   withLock(historyLock(), () => {
     const fp = fingerprint(req);
     const items = loadHistory().filter((e) => e.fp !== fp);
-    items.unshift({ id: rid, t: now(), fp, req: KEEP_SECRETS ? req : redactRequest(req), status: 0 });
+    let kept = KEEP_SECRETS ? req : redactRequest(req);
+    if (JSON.stringify(kept).length > HISTORY_REQ_MAX) kept = Object.assign({}, kept, { body: null, bodyDropped: true });
+    items.unshift({ id: rid, t: now(), fp, req: kept, status: 0 });
     saveHistory(items);
   });
 }
@@ -1697,6 +1702,7 @@ function loadRef(ref) {
   if (ref.startsWith("resp:")) return RID_RE.test(ref.slice(5)) ? cleanRequest(readJSON(`${respDir(ref.slice(5))}/request.json`, null)) : null;
   if (ref.startsWith("hist:")) {
     const e = loadHistory().find((x) => x.id === ref.slice(5));
+    if (e && e.req.bodyDropped) return loadRef(`resp:${e.id}`); // while its response folder is cached
     return e ? e.req : null;
   }
   if (ref.startsWith("saved:")) {
@@ -1773,13 +1779,18 @@ function withMods(item, mods = {}) {
   for (const k of ["cmd", "alt", "ctrl"]) item.mods[k] = mods[k] ? Object.assign({ valid: true }, mods[k]) : off;
   return item;
 }
+// ⌘C copies text.copy, which has to stay small: a long text is cut, and says so
+const CUT_NOTE = "\n… (cut: press ↩ to copy all of it)";
+function copyText(text) {
+  return text.length <= INLINE_MAX ? text : text.slice(0, INLINE_MAX) + CUT_NOTE;
+}
 function pasteMod(text, subtitle) {
   return { arg: outText(text), subtitle, variables: { http_action: "paste" } };
 }
 function copyItem(title, subtitle, text, iconName, extra = {}) {
   return withMods(Object.assign({
     title, subtitle, arg: outText(text), variables: { http_action: "copy" }, icon: icon(iconName),
-    text: { copy: text.length <= INLINE_MAX ? text : text.slice(0, INLINE_MAX), largetype: text.slice(0, 4000) },
+    text: { copy: copyText(text), largetype: text.slice(0, 4000) },
   }, extra), { cmd: pasteMod(text, "⌘↩ Paste into the frontmost app") });
 }
 
@@ -1825,7 +1836,7 @@ function requestRow(req, o) {
   const curl = toCurl(req);
   const item = {
     title: oneLine(title, 200), subtitle: sub, icon: methodIcon(req.method),
-    text: { copy: curl.length <= INLINE_MAX ? curl : curl.slice(0, INLINE_MAX), largetype: requestText(req) },
+    text: { copy: copyText(curl), largetype: requestText(req) },
   };
   // the review step is a query: "!" + the typed request, or "!" + a reference (hist:…, saved:…, clip)
   if (confirm) Object.assign(item, { valid: false, autocomplete: `!${o.review || o.ref || o.line}` });
@@ -1855,7 +1866,7 @@ function detailRows(req, withConverters = true) {
     const shown = b.kind === "multipart" ? b.fields.map(([k, v]) => `${k}=${SECRET_FIELD.test(k) ? DOTS : v}`).join(" · ") : maskBody(b.text);
     const text = b.kind === "multipart" ? b.fields.map(([k, v]) => `${k}=${v}`).join("\n") : b.text;
     items.push(copyItem(oneLine(shown, 200) || "(empty body)", `${capital(bodySummary(b))} · ↩ Copy · ⌘L Large Type`, text, "body", {
-      text: { copy: text.slice(0, INLINE_MAX), largetype: requestText(Object.assign({}, req, { headers: [], method: "", url: "" })).trim() },
+      text: { copy: copyText(text), largetype: requestText(Object.assign({}, req, { headers: [], method: "", url: "" })).trim() },
     }));
   }
   if (withConverters) items.push(...converterRows(req));
@@ -1868,7 +1879,7 @@ function converterRows(req) {
     const code = fn(req);
     if (code === null) continue;
     const shown = fn(masked);
-    items.push(copyItem(`Copy as ${name}`, oneLine(shown, 120), code, "code", { uid: `convert-${id}`, text: { copy: code.slice(0, INLINE_MAX), largetype: shown.slice(0, 4000) } }));
+    items.push(copyItem(`Copy as ${name}`, oneLine(shown, 120), code, "code", { uid: `convert-${id}`, text: { copy: copyText(code), largetype: shown.slice(0, 4000) } }));
   }
   return items;
 }
@@ -1906,6 +1917,7 @@ function historyRow(e) {
   const ago = fmtAgo(now() - e.t);
   const result = e.status ? `${e.status} ${statusName(e.status)}` : e.error ? oneLine(e.error, 40) : "no response";
   const notes = e.req.redacted ? ["secrets weren’t kept"] : [];
+  if (e.req.bodyDropped) notes.push("the body was too large to keep");
   return requestRow(e.req, { ref: `hist:${e.id}`, prefix: `${result} · ${ago}`, kind: "history", entry: e, notes });
 }
 function savedRow(e) {
@@ -2109,7 +2121,7 @@ function responseView(rid) {
     if (m.encoding && m.encoding !== "UTF-8") bits.push(`decoded from ${m.encoding}`);
     if (m.truncatedPreview) bits.push("large: previewed as is");
     bits.push(isText ? "↩ Copy · ⌘Y Quick Look · ⌘L Large Type" : "⌘Y Quick Look");
-    const item = { title: oneLine(isText ? maskBody(first) : m.previewText, 200) || "(empty)", subtitle: bits.join(" · "), icon: icon(m.kind === "image" ? "image" : "body"), quicklookurl: m.previewFile, text: { copy: isText ? m.previewText : m.bodyFile, largetype: m.previewText.slice(0, 4000) } };
+    const item = { title: oneLine(isText ? maskBody(first) : m.previewText, 200) || "(empty)", subtitle: bits.join(" · "), icon: icon(m.kind === "image" ? "image" : "body"), quicklookurl: m.previewFile, text: { copy: !isText ? m.bodyFile : m.previewText.length < 4000 && !m.truncatedPreview ? m.previewText : m.previewText + CUT_NOTE, largetype: m.previewText.slice(0, 4000) } };
     if (isText) {
       Object.assign(item, { arg: bodyArg, variables: { http_action: "copy" } });
       items.push(withMods(item, { cmd: { arg: bodyArg, subtitle: "⌘↩ Paste the body", variables: { http_action: "paste" } } }));

@@ -10,7 +10,7 @@ Type a request via the `http` keyword: a URL, optionally after a method, like `h
 
 * <kbd>↩</kbd> Send the request. POST, PUT, PATCH and DELETE show what will be sent first; press <kbd>↩</kbd> again to send.
 * <kbd>⌘</kbd><kbd>↩</kbd> Paste the request as a curl command.
-* <kbd>⌥</kbd><kbd>↩</kbd> Open the URL in the browser.
+* <kbd>⌥</kbd><kbd>↩</kbd> Open a GET request’s URL in the browser.
 * <kbd>⌘</kbd><kbd>L</kbd> Show the request in Large Type, with secrets masked.
 
 The rows below show the headers and body, and copy the request as curl, JavaScript fetch, Python requests, HTTPie or wget.
@@ -21,7 +21,7 @@ The response opens in Alfred when it arrives: status, timing (DNS, connect, TLS,
 
 ![A response](images/response.png)
 
-* <kbd>↩</kbd> Copy the body, or open an image or PDF.
+* <kbd>↩</kbd> Copy the body, open an image or PDF, or show other files in Finder.
 * <kbd>⌘</kbd><kbd>↩</kbd> Paste the body into the frontmost app.
 * <kbd>⌘</kbd><kbd>Y</kbd> Quick Look the body: JSON, HTML, images and PDFs.
 * <kbd>⌘</kbd><kbd>L</kbd> Show the status, headers and body in Large Type.
