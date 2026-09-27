@@ -136,6 +136,8 @@ class Mock(BaseHTTPRequestHandler):
             return self.send(200, b"<!doctype html><title>Hi</title><h1>Hello</h1>", "text/html; charset=utf-8")
         if p == "/empty":
             return self.send(200, b"", "text/plain")
+        if p == "/proto":
+            return self.send(200, b"hello", "constructor")
         if p == "/bidi":
             return self.send(200, "{\"x\": \"a\u202eb\"}".encode(), "application/json", [("X-Evil", "a\u202eb".encode().decode("latin-1"))])
         return self.send(404, b'{"error": "not found"}')
@@ -997,6 +999,46 @@ class AlfredRuntimeTests(Base):
             t0 = time.time()
             self.env.items(q)
             self.assertLess(time.time() - t0, 1.5, q)  # osascript startup included
+
+
+class Audit1RegressionTests(Base):
+    def test_user_without_password(self):
+        r = parse(["example.com -u alice", "curl -u alice https://e.com", "curl -u alice:pw https://e.com"])
+        self.assertEqual(r[0]["auth"], "alice:")
+        self.assertTrue(any("empty one" in n for n in r[0]["notes"]))
+        self.assertEqual(r[1]["auth"], "alice:")
+        self.assertTrue(any("empty one" in n for n in r[1]["notes"]))
+        self.assertEqual(r[2]["auth"], "alice:pw")
+
+    def test_shell_quoting_for_zsh(self):
+        conv = js("convert", ["example.com -d ^abc", "example.com -d =abc", "example.com -d ~abc"])
+        self.assertIn("--data-raw '^abc'", conv[0]["curl"])
+        self.assertIn("--data-raw '=abc'", conv[1]["curl"])
+        self.assertIn("--data-raw '~abc'", conv[2]["curl"])
+
+    def test_json_parts_are_concatenated(self):
+        r = parse(["curl https://e.com --json '{\"a\":' --json '1}'", "curl https://e.com -d a=1 -d b=2"])
+        self.assertEqual(r[0]["body"]["text"], '{"a":1}')
+        self.assertEqual(r[1]["body"]["text"], "a=1&b=2")
+
+    def test_home_view_prunes_old_stashes(self):
+        self.env.items("get example.com/one")
+        stash = os.path.join(self.env.cache, "req")
+        old = [os.path.join(stash, f) for f in os.listdir(stash)]
+        self.assertEqual(len(old), 1)
+        t = time.time() - 3 * 86400
+        os.utime(old[0], (t, t))
+        self.env.items("")
+        self.assertFalse(os.path.exists(old[0]))
+
+
+class PrototypeTests(Base):
+    def test_server_and_user_strings_never_hit_object_prototype(self):
+        rid, items = self.env.send(f"get {BASE}/proto")
+        m = self.env.meta(rid)
+        self.assertEqual((m["kind"], os.path.basename(m["bodyFile"])), ("binary", "body.bin"))
+        items = self.env.items("curl -X constructor https://e.com", confirm_writes="0")
+        self.assertEqual(items[0]["icon"]["path"], "icons/method.png")
 
 
 class PlistTests(unittest.TestCase):

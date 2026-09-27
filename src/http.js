@@ -61,7 +61,10 @@ function keyword() {
 
 const FM = $.NSFileManager.defaultManager;
 
+const MADE = new Set(); // folders this process has already created (one syscall each, not one per row)
 function mkdirs(dir, priv) {
+  if (MADE.has(dir)) return dir;
+  MADE.add(dir);
   FM.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(dir, true, $(), $());
   // requests hold Authorization headers and cookies: only this user may read them
   if (priv) FM.setAttributesOfItemAtPathError($({ NSFilePosixPermissions: 0o700 }), dir, $());
@@ -96,6 +99,7 @@ function readText(path) {
 }
 function removeFile(path) {
   FM.removeItemAtPathError(path, $());
+  MADE.delete(path);
 }
 function readJSON(path, fallback) {
   const t = readFile(path);
@@ -359,6 +363,13 @@ function addQuery(url, pairs) {
 }
 const enc = (s) => encodeURIComponent(s);
 
+// curl asks for the password on the terminal when -u has none; here it's sent empty instead
+function withPassword(auth, notes) {
+  if (auth.includes(":")) return auth;
+  notes.push("No password after the user name: sending an empty one");
+  return `${auth}:`;
+}
+
 // ---------- request model ----------
 // { method, url, headers: [[name, value]…], body: null | {kind: json|form|text|multipart, text, fields},
 //   auth: "user:pass" | null, insecure, notes: [warnings shown in the subtitle] }
@@ -518,7 +529,7 @@ function parseLine(q) {
     }
     if (!t.quoted && /^(-u|-a|--auth|--user)$/.test(s)) {
       if (j + 1 >= toks.length) throw new ParseError(`Type user:password after ${s}`);
-      req.auth = toks[++j].text;
+      req.auth = withPassword(toks[++j].text, req.notes);
       last = null;
       continue;
     }
@@ -827,7 +838,7 @@ function parseCurl(text) {
   if (!words.length || !/(^|[\\/])curl(\.exe)?$/i.test(words[0])) throw new ParseError("Not a curl command");
   const notes = new Set(wordNotes);
   const urls = [], data = [], form = [], headers = [], urlQuery = [];
-  let method = null, head = false, get = false, json = false, auth = null, insecure = false;
+  let method = null, head = false, get = false, json = false, auth = null, insecure = false, onlyJSON = true;
   const fail = (msg) => {
     throw new ParseError(msg);
   };
@@ -854,9 +865,11 @@ function parseCurl(text) {
         if (val.startsWith("@")) fail(`--${name} @… ${LOCAL_FILE}`);
         data.push(val);
         if (name === "json") json = true;
+        else onlyJSON = false;
         return;
       case "data-raw":
         data.push(val);
+        onlyJSON = false;
         return;
       case "data-urlencode":
       case "url-query": {
@@ -868,7 +881,10 @@ function parseCurl(text) {
         else if (eq === 0) part = enc(val.slice(1));
         else part = `${val.slice(0, eq)}=${enc(val.slice(eq + 1))}`;
         if (name === "url-query") urlQuery.push([part, null]);
-        else data.push(part);
+        else {
+          data.push(part);
+          onlyJSON = false;
+        }
         return;
       }
       case "form":
@@ -980,7 +996,9 @@ function parseCurl(text) {
   let url = normalizeURL(urls[0], /^[a-z][a-z0-9+.-]*:\/\//i.test(urls[0]) ? null : "http");
   url = addQuery(url, urlQuery);
   if (data.length && form.length) fail("-d and -F can’t be used together");
-  const req = { method: null, url, headers: [], body: null, auth, insecure, notes: [] };
+  const noteList = [];
+  const req = { method: null, url, headers: [], body: null, auth: auth === null ? null : withPassword(auth, noteList), insecure, notes: [] };
+  for (const n of noteList) notes.add(n);
   for (const [k, v] of headers) {
     if (k.startsWith(":")) continue; // HTTP/2 pseudo-headers from Safari
     if (/^accept-encoding$/i.test(k)) {
@@ -993,7 +1011,7 @@ function parseCurl(text) {
   if (data.length && get) {
     req.url = addQuery(req.url, data.map((d) => [d, null]));
   } else if (data.length) {
-    const text = data.join("&");
+    const text = data.join(json && onlyJSON ? "" : "&"); // curl joins --json parts as they are, -d parts with &
     if (json) {
       setDefaultHeader(req, "Content-Type", "application/json");
       setDefaultHeader(req, "Accept", "application/json");
@@ -1015,7 +1033,8 @@ function parseCurl(text) {
 
 function shq(s) {
   s = String(s);
-  return /^[A-Za-z0-9_\-.,:\/@%+=^]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+  // zsh treats ^ (extended glob), and = or ~ at the start of a word, specially: quote them
+  return /^[A-Za-z0-9_\-.,:\/@%+][A-Za-z0-9_\-.,:\/@%+=]*$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 }
 function lines(first, rest) {
   return rest.length ? [first, ...rest].join(" \\\n  ") : first;
@@ -1423,7 +1442,8 @@ function looksBinary(data) {
   return /[\x00-\x08\x0b\x0e-\x1a\x1c-\x1f]/.test(s);
 }
 
-const IMAGE_EXT = { "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/gif": "gif", "image/webp": "webp", "image/svg+xml": "svg", "image/heic": "heic", "image/bmp": "bmp", "image/tiff": "tiff", "image/x-icon": "ico", "image/vnd.microsoft.icon": "ico", "image/avif": "avif" };
+// a Map: the Content-Type comes from the server ("constructor" must not find Object.prototype)
+const IMAGE_EXT = new Map(Object.entries({ "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/gif": "gif", "image/webp": "webp", "image/svg+xml": "svg", "image/heic": "heic", "image/bmp": "bmp", "image/tiff": "tiff", "image/x-icon": "ico", "image/vnd.microsoft.icon": "ico", "image/avif": "avif" }));
 
 // Name the body file for Quick Look and build the preview (pretty JSON, transcoded text)
 function describeBody(dir, contentType, method, status) {
@@ -1440,7 +1460,7 @@ function describeBody(dir, contentType, method, status) {
   const data = $.NSData.dataWithContentsOfFile(tmp);
   const sniff = magic(data);
   let kind, ext;
-  if (IMAGE_EXT[mime] || (!mime && ["png", "jpg", "gif", "webp"].includes(sniff))) [kind, ext] = ["image", IMAGE_EXT[mime] || sniff];
+  if (IMAGE_EXT.has(mime) || (!mime && ["png", "jpg", "gif", "webp"].includes(sniff))) [kind, ext] = ["image", IMAGE_EXT.get(mime) || sniff];
   else if (mime === "application/pdf" || (!mime && sniff === "pdf")) [kind, ext] = ["pdf", "pdf"];
   else if (/[/+]json$/.test(mime) || mime === "application/x-ndjson") [kind, ext] = ["json", "json"];
   else if (mime === "text/html" || mime === "application/xhtml+xml") [kind, ext] = ["html", "html"];
@@ -1722,8 +1742,8 @@ function setClipboard(text) {
 function icon(name) {
   return { path: `icons/${name}.png` };
 }
-const METHOD_ICON = { GET: "get", HEAD: "get", OPTIONS: "get", POST: "post", PUT: "put", PATCH: "patch", DELETE: "delete" };
-const methodIcon = (m) => icon(METHOD_ICON[m] || "method");
+const METHOD_ICON = new Map(Object.entries({ GET: "get", HEAD: "get", OPTIONS: "get", POST: "post", PUT: "put", PATCH: "patch", DELETE: "delete" }));
+const methodIcon = (m) => icon(METHOD_ICON.get(m) || "method"); // a Map: methods are user input
 function statusIcon(code) {
   return icon(code >= 500 ? "s5xx" : code >= 400 ? "s4xx" : code >= 300 ? "s3xx" : code >= 200 ? "s2xx" : "info");
 }
@@ -1877,6 +1897,11 @@ function savedRow(e) {
 }
 
 function homeView() {
+  const marker = `${cacheDir()}/pruned`;
+  if (Date.now() / 1000 - mtime(marker) > 3600) {
+    writeFile(marker, "");
+    prune();
+  }
   const items = [];
   const clip = clipboardRow();
   if (clip) items.push(clip);
