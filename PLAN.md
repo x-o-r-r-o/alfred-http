@@ -61,18 +61,18 @@ This workflow: pastes curl commands from the clipboard first thing, one-line HTT
 ## Verify in real Alfred
 - [ ] “Remember secrets” on: send a request with an Authorization header; Keychain Access shows an item “HTTP request secrets (Alfred HTTP, history)” and no prompt appears when sending it again from the history or pressing ⌘↩ on its row (item created and read by /usr/bin/osascript).
 - [ ] `http save` a request with a token, then send it: no Keychain prompt; delete it (⌃↩): the Keychain item is gone.
-- [ ] ⌘Y on an HTML response (e.g. `http example.com`) shows the simplified page with the grey “Preview without scripts…” note, and Little Snitch/`nettop` shows no request from Quick Look; ⌘Y on an SVG response shows the image.
+- [ ] ⌘Y on an HTML response (e.g. `http example.com`) shows the simplified page with the grey “Preview without scripts…” note, and Little Snitch/`nettop` shows no request from Quick Look; ⌘Y on an SVG response shows the image. (HTML page with a script and a remote image checked against a local demo server: note shown, both stripped; nettop and SVG not checked)
 - [ ] With an HTTP proxy set in System Settings › Network, a request goes through it (proxy log), and `localhost` doesn't.
-- [ ] ↩ on a GET row: Alfred reopens on `http =<id>`, shows "Sending…" and then the response without losing the selection (rerun 0.3 s, uids).
-- [ ] POST row: ↩ autocompletes to `!<id>` (review), ↩ sends, Cancel returns to the typed request.
+- [x] ↩ on a GET row: Alfred reopens on `http =<id>`, shows "Sending…" and then the response without losing the selection (rerun 0.3 s, uids).
+- [x] POST row: ↩ autocompletes to `!<id>` (review), ↩ sends, Cancel returns to the typed request.
 - [ ] ⌘Y Quick Look of preview.json, HTML (no remote loads), PNG, PDF; ⌘L Large Type of the status row.
-- [ ] ⌘↩ pastes the body / curl command, including a >50 KB one (resolve.sh).
-- [ ] Universal Action "Send with HTTP" on a selected curl command and on a URL.
+- [ ] ⌘↩ pastes the body / curl command, including a >50 KB one (resolve.sh). (curl command of a POST pasted into TextEdit; >50 KB not checked)
+- [ ] Universal Action "Send with HTTP" on a selected curl command and on a URL. (curl command checked)
 - [ ] Clipboard row with a real "Copy as cURL (bash)" from Chrome, Safari and Firefox, and Chrome's "(cmd)" variant.
-- [ ] ↩ Cancel while a slow request runs; the request stops (no curl left in Activity Monitor).
+- [x] ↩ Cancel while a slow request runs; the request stops (no curl left in Activity Monitor).
 - [ ] Notifications for save/delete/clear; no blank notification after copy.
 - [ ] Workflow Configuration: keyword, timeout, size limit, follow redirects, ask before sending, remember secrets (off by default).
-- [ ] Screenshots for every `images/*.png` referenced in the README.
+- [x] Screenshots for every `images/*.png` referenced in the README.
 
 ## Release checklist (Alfred forum + Gallery)
 - [x] README starts with `## Usage`; each paragraph ends "via the `http` keyword" / "via the Universal Action"
